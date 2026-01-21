@@ -1,0 +1,21 @@
+[[permission]]
+identifier = "allow-db-commands"
+description = "Allow DB commands"
+commands.allow = [
+    "greet",
+    "test_connection",
+    "save_connection",
+    "get_connections",
+    "delete_connection",
+    "get_tables",
+    "get_databases",
+    "get_columns",
+    "execute_query",
+    "alter_table",
+    "get_indexes",
+    "get_ai_config",
+    "save_ai_config",
+    "generate_sql_from_text",
+    "get_redis_key_value"
+]
+

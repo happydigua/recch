@@ -1,0 +1,12 @@
+{
+  "identifier": "default",
+  "description": "Default capability for the main window",
+  "windows": [
+    "main"
+  ],
+  "permissions": [
+    "core:default",
+    "opener:default",
+    "allow-db-commands"
+  ]
+}
