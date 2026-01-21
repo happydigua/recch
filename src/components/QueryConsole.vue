@@ -247,7 +247,7 @@ defineExpose({
   justify-content: flex-end;
   flex-wrap: wrap;
   gap: 8px;
-  padding-right: 4px; /* Small safe area */
+  padding-right: 12px; /* Safe area for buttons */
   width: 100%;
 }
 .results-area {

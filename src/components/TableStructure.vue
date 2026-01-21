@@ -486,6 +486,7 @@ async function handleSubmit() {
 }
 .toolbar {
     margin-bottom: 8px;
+    padding-right: 12px;
 }
 .table-container {
     flex: 1;

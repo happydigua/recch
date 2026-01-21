@@ -127,6 +127,7 @@ function formatTTL(ttl: number): string {
   display: flex;
   flex-direction: column;
   gap: 12px;
+  padding-right: 12px;
 }
 
 .key-details {

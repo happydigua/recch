@@ -27,6 +27,8 @@ const data = ref<any[]>([])
 const total = ref(0)
 const page = ref(1)
 const pageSize = ref(100)
+const sortColumn = ref<string | null>(null)
+const sortOrder = ref<'ascend' | 'descend' | false>(false)
 const pageSizeOptions = [
     { label: '20 行', value: 20 },
     { label: '50 行', value: 50 },
@@ -62,30 +64,40 @@ const tableColumns = computed<DataTableColumns>(() => {
             width: 150,
             // Disable default ellipsis tooltip for JSON/Text types, let our custom renderer handle it
             ellipsis: !['json', 'text'].some(t => col.type_name?.toLowerCase().includes(t)) ? { tooltip: true } : undefined,
-            sorter: 'default' as const,
+            sorter: true,
+            sortOrder: sortColumn.value === col.name ? sortOrder.value : false,
             render(row: any) {
                 let val = row[col.name];
                 
-                // Check if column is JSON-like or value is an object
-                const isJsonCol = ['json'].some(t => col.type_name?.toLowerCase().includes(t));
-                
-                // If it's a string but supposed to be JSON, try to parse it
-                if (isJsonCol && typeof val === 'string') {
-                    try {
-                        val = JSON.parse(val);
-                    } catch (e) {
-                         // ignore, treat as string
+                // Try to detect and parse JSON strings (in TEXT/VARCHAR fields too)
+                let parsedJson = null;
+                if (typeof val === 'string' && val.trim()) {
+                    const trimmed = val.trim();
+                    // Check if it looks like JSON (starts with { or [)
+                    if ((trimmed.startsWith('{') && trimmed.endsWith('}')) || 
+                        (trimmed.startsWith('[') && trimmed.endsWith(']'))) {
+                        try {
+                            parsedJson = JSON.parse(val);
+                        } catch (e) {
+                            // Not valid JSON, treat as regular string
+                        }
                     }
+                }
+                
+                // Use parsed JSON if available
+                if (parsedJson !== null) {
+                    val = parsedJson;
                 }
 
                 if (val === null) {
                     return h('span', { style: 'color: #ccc; font-style: italic;' }, '[NULL]')
                 }
 
-                if ((typeof val === 'object' && val !== null) || (isJsonCol && val)) {
-                   // Custom tooltip for JSON objects / JSON columns
-                   const compact = typeof val === 'string' ? val : JSON.stringify(val);
-                   const formatted = typeof val === 'string' ? val : JSON.stringify(val, null, 2);
+                // Render as JSON popover if it's an object or was detected as JSON
+                if (typeof val === 'object' && val !== null) {
+                   const fullStr = JSON.stringify(val);
+                   const preview = fullStr.length > 50 ? fullStr.slice(0, 50) + '...' : fullStr;
+                   const formatted = JSON.stringify(val, null, 2);
                    
                    return h(NPopover, { 
                        trigger: 'hover', 
@@ -95,7 +107,7 @@ const tableColumns = computed<DataTableColumns>(() => {
                    }, {
                        trigger: () => h('div', { 
                            style: 'max-width: 150px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; cursor: pointer; color: #18a058;' 
-                       }, compact),
+                       }, preview),
                        default: () => h('div', {
                            style: 'background-color: #e7f5ee; color: #18a058; padding: 12px; border-radius: 4px; max-height: 60vh; max-width: 400px; overflow-y: auto;' 
                        }, [
@@ -105,6 +117,29 @@ const tableColumns = computed<DataTableColumns>(() => {
                        ])
                    });
                 }
+                
+                // Truncate long text strings (> 100 chars) with hover to see full content
+                if (typeof val === 'string' && val.length > 100) {
+                   const preview = val.slice(0, 80) + '...';
+                   
+                   return h(NPopover, { 
+                       trigger: 'hover', 
+                       placement: 'right-start', 
+                       style: { padding: 0, maxWidth: '500px' }
+                   }, {
+                       trigger: () => h('div', { 
+                           style: 'max-width: 150px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; cursor: pointer; color: #666;' 
+                       }, preview),
+                       default: () => h('div', {
+                           style: 'padding: 12px; max-height: 60vh; max-width: 480px; overflow-y: auto;' 
+                       }, [
+                           h('pre', { 
+                               style: 'margin: 0; white-space: pre-wrap; font-size: 12px; word-break: break-all;' 
+                           }, val)
+                       ])
+                   });
+                }
+                
                 return val;
             }
         })),
@@ -163,7 +198,14 @@ async function loadData() {
             total.value = Number(countRes[0].cx || countRes[0].count || 0)
         }
 
-        const dataQuery = `SELECT * FROM ${props.table} LIMIT ${limit} OFFSET ${offset}`
+        // Build ORDER BY clause if sorting is active
+        let orderBy = ''
+        if (sortColumn.value && sortOrder.value) {
+            const direction = sortOrder.value === 'ascend' ? 'ASC' : 'DESC'
+            orderBy = ` ORDER BY \`${sortColumn.value}\` ${direction}`
+        }
+
+        const dataQuery = `SELECT * FROM ${props.table}${orderBy} LIMIT ${limit} OFFSET ${offset}`
         const rows = await invoke<any[]>('execute_query', {
              config: props.config,
              query: dataQuery
@@ -188,6 +230,19 @@ watch(() => props.table, () => {
 }, { immediate: true })
 
 watch(page, loadData)
+
+// Handle server-side sorting
+function handleSorterChange(sorter: { columnKey: string, order: 'ascend' | 'descend' | false } | null) {
+    if (sorter && sorter.order) {
+        sortColumn.value = sorter.columnKey
+        sortOrder.value = sorter.order
+    } else {
+        sortColumn.value = null
+        sortOrder.value = false
+    }
+    page.value = 1 // Reset to first page when sorting
+    loadData()
+}
 
 function openCreate() {
     modalMode.value = 'create'
@@ -316,11 +371,13 @@ async function handleSubmit() {
             :data="data"
             :loading="loading"
             flex-height
+            remote
             :row-key="(row) => primaryKey ? row[primaryKey] : (row.id || Object.values(row).join('-'))"
             style="height: 100%"
             size="small"
             :bordered="false"
             :scroll-x="tableMetadata.length * 150 + 100"
+            @update:sorter="handleSorterChange"
           />
       </div>
 
@@ -356,7 +413,7 @@ async function handleSubmit() {
 }
 .toolbar {
     margin-bottom: 8px;
-    padding-right: 0;
+    padding-right: 12px;
 }
 .table-container {
     flex: 1;

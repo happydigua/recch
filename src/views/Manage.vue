@@ -220,6 +220,6 @@ onMounted(() => {
     flex: 1;
     min-height: 0; /* Important for nested scrolling */
     overflow-x: hidden; /* Prevent horizontal scroll causing cutoff */
-    padding-right: 4px; /* Small safe buffer */
+    padding-right: 12px; /* Safe buffer for scrollbar and content */
 }
 </style>
