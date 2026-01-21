@@ -26,6 +26,7 @@ jobs:
         run: npm install
         
       - name: cargo check
+        working-directory: src-tauri
         run: cargo check
         
       - name: build frontend
