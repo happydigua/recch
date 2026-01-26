@@ -647,22 +647,33 @@ async fn get_indexes(config: ConnectionConfig, table: String) -> Result<Vec<Inde
             }
             let mut conn = opts.connect().await.map_err(|e| e.to_string())?;
 
-            let rows: Vec<(String, String, i32, String)> = sqlx::query_as(
-                "
+            let rows: Vec<(Option<Vec<u8>>, Option<Vec<u8>>, i32, Option<Vec<u8>>)> =
+                sqlx::query_as(
+                    "
                 SELECT INDEX_NAME, COLUMN_NAME, NON_UNIQUE, INDEX_COMMENT 
                 FROM information_schema.STATISTICS 
                 WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?
                 ORDER BY INDEX_NAME, SEQ_IN_INDEX
             ",
-            )
-            .bind(&table)
-            .fetch_all(&mut conn)
-            .await
-            .map_err(|e| e.to_string())?;
+                )
+                .bind(&table)
+                .fetch_all(&mut conn)
+                .await
+                .map_err(|e| e.to_string())?;
 
             // Group by index name
             let mut indexes: Vec<IndexDef> = Vec::new();
-            for (idx_name, col_name, non_unique, comment) in rows {
+            for (idx_name_bytes, col_name_bytes, non_unique, comment_bytes) in rows {
+                let idx_name = idx_name_bytes
+                    .map(|b| String::from_utf8_lossy(&b).to_string())
+                    .unwrap_or_default();
+                let col_name = col_name_bytes
+                    .map(|b| String::from_utf8_lossy(&b).to_string())
+                    .unwrap_or_default();
+                let comment = comment_bytes
+                    .map(|b| String::from_utf8_lossy(&b).to_string())
+                    .unwrap_or_default();
+
                 if let Some(last) = indexes.last_mut() {
                     if last.name == idx_name {
                         last.columns.push(col_name);
@@ -1115,9 +1126,9 @@ async fn execute_query(
                                 },
                             }
                         }
-                        _ if type_name.contains("BINARY")
-                            || type_name.contains("BLOB")
-                            || type_name.contains("BYTEA") =>
+                        _ if type_name.to_uppercase().contains("BINARY")
+                            || type_name.to_uppercase().contains("BLOB")
+                            || type_name.to_uppercase().contains("BYTEA") =>
                         {
                             // Handle binary types: VARBINARY, BINARY, BLOB, TINYBLOB, MEDIUMBLOB, LONGBLOB, BYTEA (PG)
                             match row.try_get::<Option<Vec<u8>>, _>(col.ordinal()) {
@@ -1257,6 +1268,24 @@ async fn execute_query(
                                 Value::Null
                             }
                         }
+                        "BYTEA" | "VARBINARY" | "BINARY" | "BLOB" => {
+                            // Handle binary types explicitly for Postgres/Generic
+                            match row.try_get::<Option<Vec<u8>>, _>(col.ordinal()) {
+                                Ok(Some(v)) => {
+                                    // Display as hex, truncated for readability
+                                    let hex: String =
+                                        v.iter().take(32).map(|b| format!("{:02X}", b)).collect();
+                                    let suffix = if v.len() > 32 {
+                                        format!("... ({} bytes)", v.len())
+                                    } else {
+                                        String::new()
+                                    };
+                                    json!(format!("0x{}{}", hex, suffix))
+                                }
+                                Ok(None) => Value::Null,
+                                Err(_) => Value::Null,
+                            }
+                        }
                         _ => {
                             // PG also calls text TEXT, varchar VARCHAR
                             match row.try_get::<Option<String>, _>(col.ordinal()) {
@@ -1266,7 +1295,20 @@ async fn execute_query(
                                     // but try_get::<String> might fail if sqlx strictly maps them.
                                     // Try simple ToString if possible or empty.
                                     // For now, let's try to get as ANY string representation or NULL
-                                    Value::Null
+
+                                    // Second fallback: try as binary blob
+                                    match row.try_get::<Option<Vec<u8>>, _>(col.ordinal()) {
+                                        Ok(Some(v)) => {
+                                            let hex: String = v
+                                                .iter()
+                                                .take(16)
+                                                .map(|b| format!("{:02X}", b))
+                                                .collect();
+                                            let suffix = if v.len() > 16 { "..." } else { "" };
+                                            json!(format!("[BLOB: 0x{}{}]", hex, suffix))
+                                        }
+                                        _ => Value::Null,
+                                    }
                                 }
                             }
                         }

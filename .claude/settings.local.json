@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git add:*)",
+      "Bash(git commit -m \"$\\(cat <<''EOF''\nfix: structure page loading issues and binary data handling\n\n- Fix index loading by properly handling UTF-8 conversion from bytes\n- Improve binary data display in query results \\(BYTEA/BLOB/BINARY\\)\n- Add debug logging and improved layout for TableStructure component\nEOF\n\\)\")"
+    ]
+  }
+}

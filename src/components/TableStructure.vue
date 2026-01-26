@@ -159,13 +159,20 @@ const indexGridColumns = computed<DataTableColumns<IndexDef>>(() => [
 
 async function loadColumns() {
     loading.value = true
+    console.log('Loading columns for:', {
+        table: props.table,
+        database: props.database,
+        config: props.config
+    })
     try {
         columns.value = await invoke('get_columns', {
             config: props.config,
             table: props.table,
             database: props.database
         })
+        console.log('Columns loaded:', columns.value)
     } catch (e) {
+        console.error('Error loading columns:', e)
         message.error(String(e))
     } finally {
         loading.value = false
@@ -174,12 +181,15 @@ async function loadColumns() {
 
 async function loadIndexes() {
     loadingIndexes.value = true
+    console.log('Loading indexes for:', props.table)
     try {
         indexes.value = await invoke('get_indexes', {
             config: props.config,
             table: props.table
         })
+        console.log('Indexes loaded:', indexes.value)
     } catch (e) {
+        console.error('Error loading indexes:', e)
         message.error(String(e))
     } finally {
         loadingIndexes.value = false
@@ -375,9 +385,20 @@ async function handleSubmit() {
                             :loading="loading" 
                             flex-height
                             style="height: 100%"
-                            size="small" 
+                            size="small"
                             :scroll-x="1000"
                         />
+                        <div v-if="!loading && columns.length === 0" style="padding: 20px; color: #666;">
+                            <p>No columns found.</p>
+                            <div style="background: #f5f5f5; padding: 10px; border-radius: 4px; font-family: monospace; font-size: 12px;">
+                                <p><strong>Debug Info:</strong></p>
+                                <p>Rows Loaded: {{ columns.length }}</p>
+                                <p>Table: {{ props.table }}</p>
+                                <p>Database: {{ props.database || config.database || '(none)' }}</p>
+                                <p>Host: {{ config.host }}</p>
+                                <p>DB Type: {{ config.db_type }}</p>
+                            </div>
+                        </div>
                     </div>
                 </div>
             </NTabPane>
@@ -479,21 +500,40 @@ async function handleSubmit() {
 .table-structure {
     height: 100%;
 }
-.pane-content {
+
+/* 强制 Tabs 使用 Flex 布局以撑满高度 */
+:deep(.n-tabs) {
     display: flex;
     flex-direction: column;
     height: 100%;
 }
+:deep(.n-tabs-nav) {
+    flex-shrink: 0;
+}
+:deep(.n-tabs-pane-wrapper) {
+    flex: 1;
+    min-height: 0;
+    overflow: hidden;
+}
+:deep(.n-tab-pane) {
+    height: 100%;
+    padding: 0;
+}
+
+.pane-content {
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+    padding-top: 10px;
+}
 .toolbar {
     margin-bottom: 8px;
     padding-right: 12px;
+    flex-shrink: 0;
 }
 .table-container {
     flex: 1;
     min-height: 0;
     box-sizing: border-box;
-}
-:deep(.n-tabs-pane-wrapper) {
-    height: 100%;
 }
 </style>
