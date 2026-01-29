@@ -379,26 +379,15 @@ async function handleSubmit() {
                     </NSpace>
                     
                     <div class="table-container">
-                        <NDataTable 
-                            :columns="gridColumns" 
-                            :data="columns" 
-                            :loading="loading" 
+                        <NDataTable
+                            :columns="gridColumns"
+                            :data="columns"
+                            :loading="loading"
                             flex-height
                             style="height: 100%"
                             size="small"
                             :scroll-x="1000"
                         />
-                        <div v-if="!loading && columns.length === 0" style="padding: 20px; color: #666;">
-                            <p>No columns found.</p>
-                            <div style="background: #f5f5f5; padding: 10px; border-radius: 4px; font-family: monospace; font-size: 12px;">
-                                <p><strong>Debug Info:</strong></p>
-                                <p>Rows Loaded: {{ columns.length }}</p>
-                                <p>Table: {{ props.table }}</p>
-                                <p>Database: {{ props.database || config.database || '(none)' }}</p>
-                                <p>Host: {{ config.host }}</p>
-                                <p>DB Type: {{ config.db_type }}</p>
-                            </div>
-                        </div>
                     </div>
                 </div>
             </NTabPane>

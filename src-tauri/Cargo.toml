@@ -1,6 +1,6 @@
 [package]
 name = "recch"
-version = "0.1.0"
+version = "0.3.0"
 description = "RECCH - A lightweight database manager for MySQL, PostgreSQL and Redis"
 authors = ["you"]
 edition = "2021"

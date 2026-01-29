@@ -6,6 +6,57 @@ import { invoke } from '../utils/tauri'
 import { useI18n } from 'vue-i18n'
 import type { ConnectionConfig } from '../types'
 
+interface TableInfo {
+  name: string
+  data_size?: number
+  index_size?: number
+  total_size?: number
+  row_count?: number
+  comment?: string
+}
+
+function formatBytes(bytes: number | undefined): string {
+  if (bytes === undefined || bytes === null) return ''
+  if (bytes === 0) return '0 B'
+  const k = 1024
+  const sizes = ['B', 'KB', 'MB', 'GB', 'TB']
+  const i = Math.floor(Math.log(bytes) / Math.log(k))
+  return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i]
+}
+
+function formatNumber(num: number | undefined): string {
+    if (num === undefined || num === null) return ''
+    if (num >= 1000000) {
+        return (num / 1000000).toFixed(1) + 'M'
+    }
+    if (num >= 1000) {
+        return (num / 1000).toFixed(1) + 'k'
+    }
+    return num.toString()
+}
+
+function renderLabel(option: { name: string, row_count?: number, total_size?: number }) {
+    return h('div', { 
+        style: 'display: flex; align-items: center; width: 100%; overflow: hidden;' 
+    }, [
+        h('span', { 
+            style: 'overflow: hidden; text-overflow: ellipsis; white-space: nowrap; margin-right: 8px;' 
+        }, option.name),
+        h('div', { style: 'flex: 1' }), // Spacer
+        h('div', { 
+            style: 'display: flex; gap: 8px; font-size: 11px; color: #999; flex-shrink: 0; align-items: center;' 
+        }, [
+            option.row_count !== undefined && option.row_count !== null 
+                ? h('span', null, `${formatNumber(option.row_count)} rows`)
+                : null,
+             (option.row_count !== undefined && option.total_size !== undefined) ? h('span', {style: 'opacity: 0.3'}, '|') : null,
+            option.total_size !== undefined && option.total_size !== null
+                ? h('span', null, formatBytes(option.total_size))
+                : null
+        ].filter(Boolean))
+    ])
+}
+
 const props = defineProps<{
   config: ConnectionConfig
 }>()
@@ -28,15 +79,16 @@ async function loadRoot() {
   treeData.value = []
   try {
     if (isSingleDb.value) {
-      // Single DB: fetch tables directly
-      const tables = await invoke<string[]>('get_tables', { config: props.config })
-      treeData.value = tables.map(t => ({
-        label: t,
-        key: t,
-        type: 'table',
-        isLeaf: true,
-        prefix: () => h(NIcon, null, { default: () => h(isRedis.value ? KeyOutline : FlashOutline) })
-      }))
+      const tables = await invoke<TableInfo[]>('get_tables', { config: props.config })
+      treeData.value = tables.map(t => {
+        return {
+          label: () => renderLabel(t),
+          key: t.name,
+          type: 'table',
+          isLeaf: true,
+          prefix: () => h(NIcon, null, { default: () => h(isRedis.value ? KeyOutline : FlashOutline) })
+        }
+      })
     } else {
       // Multi DB: fetch databases
       const dbs = await invoke<string[]>('get_databases', { config: props.config })
@@ -60,19 +112,22 @@ async function handleLoadChildren(node: TreeOption) {
     if (node.type === 'database') {
         const dbName = node.key as string
         try {
-            const tables = await invoke<string[]>('get_tables', { 
+            const tables = await invoke<TableInfo[]>('get_tables', { 
                 config: props.config,
                 database: dbName
             })
-            node.children = tables.map(t => ({
-                label: t,
-                key: `${dbName}.${t}`, // Unique key
-                type: 'table',
-                isLeaf: true,
-                prefix: () => h(NIcon, null, { default: () => h(isRedis.value ? KeyOutline : FlashOutline) }),
-                dbName: dbName, // Custom payload
-                tableName: t
-            }))
+            node.children = tables.map(t => {
+                return {
+                    label: () => renderLabel(t),
+                    key: `${dbName}.${t.name}`, // Unique key
+                    type: 'table',
+                    isLeaf: true,
+                    prefix: () => h(NIcon, null, { default: () => h(isRedis.value ? KeyOutline : FlashOutline) }),
+                    uniqueKey: `${dbName}.${t.name}`,
+                    dbName: dbName, // Custom payload
+                    tableName: t.name
+                }
+            })
             return Promise.resolve()
         } catch (e) {
             console.error(e)
@@ -147,6 +202,13 @@ onMounted(() => {
   height: 100%;
   display: flex;
   flex-direction: column;
+}
+
+/* Allow tree nodes to expand to full width for our flex layout */
+/* Leveraging global or deep selector might be needed if scoped doesn't reach internal node */
+:deep(.n-tree-node-content) {
+    flex: 1;
+    overflow: hidden;
 }
 
 .title {

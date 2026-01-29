@@ -25,6 +25,16 @@ pub struct ConnectionConfig {
     pub database: Option<String>,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct TableInfo {
+    pub name: String,
+    pub data_size: Option<i64>,  // bytes
+    pub index_size: Option<i64>, // bytes
+    pub total_size: Option<i64>, // bytes
+    pub row_count: Option<i64>,  // rows
+    pub comment: Option<String>,
+}
+
 #[tauri::command]
 async fn test_connection(config: ConnectionConfig) -> Result<String, String> {
     match config.db_type.as_str() {
@@ -273,7 +283,7 @@ async fn get_databases(config: ConnectionConfig) -> Result<Vec<String>, String> 
 async fn get_tables(
     config: ConnectionConfig,
     database: Option<String>,
-) -> Result<Vec<String>, String> {
+) -> Result<Vec<TableInfo>, String> {
     match config.db_type.as_str() {
         "mysql" => {
             let mut opts = MySqlConnectOptions::new()
@@ -288,17 +298,72 @@ async fn get_tables(
 
             // Use provided database or config default
             let target_db = database.or(config.database);
-            if let Some(db) = target_db {
+            let mut db_name = String::new();
+            if let Some(db) = &target_db {
                 if !db.is_empty() {
-                    opts = opts.database(&db);
+                    opts = opts.database(db);
+                    db_name = db.clone();
                 }
             }
 
             let mut conn = opts.connect().await.map_err(|e| e.to_string())?;
-            let tables: Vec<String> = sqlx::query_scalar("SHOW TABLES")
+
+            // Handle current_db safely
+            let current_db: String = if !db_name.is_empty() {
+                db_name
+            } else {
+                let row: Option<String> = sqlx::query_scalar("SELECT DATABASE()")
+                    .fetch_one(&mut conn)
+                    .await
+                    .unwrap_or(None);
+                row.unwrap_or_default()
+            };
+
+            // If we still don't have a DB name, we can't query information_schema for specific table schema easily
+            // But if we are connected, `SHOW TABLES` works.
+            // Let's rely on `SHOW TABLE STATUS` which provides size info and is safer than querying information_schema if DB is ambiguous
+            // Actually `information_schema.TABLES` is standard.
+
+            let query = "
+                SELECT 
+                    TABLE_NAME, 
+                    DATA_LENGTH, 
+                    INDEX_LENGTH, 
+                    TABLE_ROWS,
+                    TABLE_COMMENT 
+                FROM information_schema.TABLES 
+                WHERE TABLE_SCHEMA = ?
+            ";
+
+            // Use Row to manually extract to avoid strict type mapping issues (u64 vs i64)
+            let rows = sqlx::query(query)
+                .bind(&current_db)
                 .fetch_all(&mut conn)
                 .await
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| format!("Failed to fetch tables: {}", e))?;
+
+            let mut tables = Vec::new();
+            for row in rows {
+                let name: String = row.try_get("TABLE_NAME").unwrap_or_default();
+                // DATA_LENGTH is BIGINT UNSIGNED (u64), cast to i64
+                let data_len: Option<u64> = row.try_get("DATA_LENGTH").ok();
+                let index_len: Option<u64> = row.try_get("INDEX_LENGTH").ok();
+                let table_rows: Option<u64> = row.try_get("TABLE_ROWS").ok();
+                let comment: Option<String> = row.try_get("TABLE_COMMENT").ok();
+
+                let d_size = data_len.map(|v| v as i64);
+                let i_size = index_len.map(|v| v as i64);
+                let rows_count = table_rows.map(|v| v as i64);
+
+                tables.push(TableInfo {
+                    name,
+                    data_size: d_size,
+                    index_size: i_size,
+                    total_size: Some(d_size.unwrap_or(0) + i_size.unwrap_or(0)),
+                    row_count: rows_count,
+                    comment,
+                });
+            }
             Ok(tables)
         }
         "postgresql" => {
@@ -318,12 +383,45 @@ async fn get_tables(
             }
 
             let mut conn = opts.connect().await.map_err(|e| e.to_string())?;
-            let tables: Vec<String> = sqlx::query_scalar(
-                "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'",
-            )
-            .fetch_all(&mut conn)
-            .await
-            .map_err(|e| e.to_string())?;
+
+            // Query for tables + sizes
+            // We use pg_total_relation_size(oid) and pg_relation_size(oid)
+            let query = "
+                SELECT 
+                    c.relname as table_name,
+                    pg_relation_size(c.oid) as data_size,
+                    pg_indexes_size(c.oid) as index_size,
+                    pg_total_relation_size(c.oid) as total_size,
+                    CAST(c.reltuples AS BIGINT) as row_count,
+                    obj_description(c.oid, 'pg_class') as comment
+                FROM pg_class c
+                JOIN pg_namespace n ON n.oid = c.relnamespace
+                WHERE n.nspname = 'public' AND c.relkind = 'r'
+            ";
+
+            let rows: Vec<(
+                String,
+                Option<i64>,
+                Option<i64>,
+                Option<i64>,
+                Option<i64>,
+                Option<String>,
+            )> = sqlx::query_as(query)
+                .fetch_all(&mut conn)
+                .await
+                .map_err(|e| e.to_string())?;
+
+            let tables = rows
+                .into_iter()
+                .map(|(name, data, index, total, rows, comment)| TableInfo {
+                    name,
+                    data_size: data,
+                    index_size: index,
+                    total_size: total,
+                    row_count: rows,
+                    comment,
+                })
+                .collect();
             Ok(tables)
         }
         "redis" => {
@@ -369,7 +467,20 @@ async fn get_tables(
                 .query_async(&mut con)
                 .await
                 .map_err(|e| e.to_string())?;
-            Ok(keys)
+
+            let tables = keys
+                .into_iter()
+                .map(|k| TableInfo {
+                    name: k,
+                    data_size: None,
+                    index_size: None,
+                    total_size: None,
+                    row_count: None,
+                    comment: None,
+                })
+                .collect();
+
+            Ok(tables)
         }
         _ => Err("Unsupported database type for tables".to_string()),
     }
