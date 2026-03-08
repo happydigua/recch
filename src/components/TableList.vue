@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref, onMounted, computed, h } from 'vue'
-import { NInput, NSpace, NSpin, NEmpty, NIcon, NButton, NTree, type TreeOption } from 'naive-ui'
+import { NInput, NSpace, NSpin, NEmpty, NIcon, NButton, NTree, NCheckbox, type TreeOption } from 'naive-ui'
 import { SearchOutline, RefreshOutline, FlashOutline, FolderOutline, KeyOutline } from '@vicons/ionicons5'
 import { invoke } from '../utils/tauri'
 import { useI18n } from 'vue-i18n'
@@ -35,6 +35,10 @@ function formatNumber(num: number | undefined): string {
     return num.toString()
 }
 
+// Global or module level state for toggles (persisted across re-renders)
+const showRows = ref(true)
+const showSize = ref(true)
+
 function renderLabel(option: { name: string, row_count?: number, total_size?: number }) {
     return h('div', { 
         style: 'display: flex; align-items: center; width: 100%; overflow: hidden;' 
@@ -46,11 +50,11 @@ function renderLabel(option: { name: string, row_count?: number, total_size?: nu
         h('div', { 
             style: 'display: flex; gap: 8px; font-size: 11px; color: #999; flex-shrink: 0; align-items: center;' 
         }, [
-            option.row_count !== undefined && option.row_count !== null 
+            (showRows.value && option.row_count !== undefined && option.row_count !== null) 
                 ? h('span', null, `${formatNumber(option.row_count)} rows`)
                 : null,
-             (option.row_count !== undefined && option.total_size !== undefined) ? h('span', {style: 'opacity: 0.3'}, '|') : null,
-            option.total_size !== undefined && option.total_size !== null
+            (showRows.value && showSize.value && option.row_count !== undefined && option.total_size !== undefined) ? h('span', {style: 'opacity: 0.3'}, '|') : null,
+            (showSize.value && option.total_size !== undefined && option.total_size !== null)
                 ? h('span', null, formatBytes(option.total_size))
                 : null
         ].filter(Boolean))
@@ -66,13 +70,14 @@ const emit = defineEmits<{
 }>()
 
 const { t } = useI18n()
-const treeData = ref<TreeOption[]>([])
+const treeData = ref<any[]>([])
 const loading = ref(false)
 const searchText = ref('')
 
 // Check if we are in single DB mode or Multi-DB mode
 const isSingleDb = computed(() => !!props.config.database)
 const isRedis = computed(() => props.config.db_type === 'redis')
+const treeIndent = computed(() => isSingleDb.value ? 0 : 16)
 
 async function loadRoot() {
   loading.value = true
@@ -108,7 +113,7 @@ async function loadRoot() {
   }
 }
 
-async function handleLoadChildren(node: TreeOption) {
+async function handleLoadChildren(node: any) {
     if (node.type === 'database') {
         const dbName = node.key as string
         try {
@@ -116,7 +121,7 @@ async function handleLoadChildren(node: TreeOption) {
                 config: props.config,
                 database: dbName
             })
-            node.children = tables.map(t => {
+            node.children = tables.map((t: any) => {
                 return {
                     label: () => renderLabel(t),
                     key: `${dbName}.${t.name}`, // Unique key
@@ -157,24 +162,33 @@ function handleNodeClick(_keys: string[], option: (TreeOption | null)[]) {
 onMounted(() => {
   loadRoot()
 })
+
+defineExpose({
+  reload: loadRoot
+})
 </script>
 
 <template>
   <div class="table-list">
     <NSpace vertical :size="12" style="height: 100%">
-      <NSpace justify="space-between" align="center">
-         <span class="title">{{ isRedis ? 'Keys' : (isSingleDb ? t('manage.tables') : t('connection.database')) }}</span>
-         <NButton text size="tiny" @click="loadRoot">
+      <div class="toolbar">
+        <div class="toolbar-left">
+          <NButton text size="tiny" @click="loadRoot">
             <template #icon><NIcon><RefreshOutline /></NIcon></template>
-         </NButton>
-      </NSpace>
+          </NButton>
+          <div v-if="isSingleDb" class="display-options">
+            <NCheckbox v-model:checked="showRows" size="small">Rows</NCheckbox>
+            <NCheckbox v-model:checked="showSize" size="small">Size / KB</NCheckbox>
+          </div>
+        </div>
+      </div>
       
       <div class="search-box">
-          <NInput v-model:value="searchText" :placeholder="t('common.search')" size="small">
-            <template #prefix>
-              <NIcon><SearchOutline /></NIcon>
-            </template>
-          </NInput>
+        <NInput v-model:value="searchText" :placeholder="t('common.search')" size="small">
+          <template #prefix>
+            <NIcon><SearchOutline /></NIcon>
+          </template>
+        </NInput>
       </div>
 
       <div class="tree-container">
@@ -183,6 +197,7 @@ onMounted(() => {
                 block-line
                 expand-on-click
                 :data="treeData"
+                :indent="treeIndent"
                 :pattern="searchText"
                 :show-irrelevant-nodes="false"
                 :on-load="handleLoadChildren"
@@ -205,19 +220,55 @@ onMounted(() => {
 }
 
 /* Allow tree nodes to expand to full width for our flex layout */
-/* Leveraging global or deep selector might be needed if scoped doesn't reach internal node */
+/* Forcing Naive UI Tree to align left and remove default paddings */
 :deep(.n-tree-node-content) {
     flex: 1;
     overflow: hidden;
+    padding-left: 0 !important;
+}
+:deep(.n-tree-node-wrapper) {
+    padding-left: 0 !important;
+}
+:deep(.n-tree-node) {
+    padding-left: 0 !important;
+}
+:deep(.n-tree-node-switcher) {
+    width: 16px !important;
+    min-width: 16px !important;
+    margin-right: 4px;
+}
+:deep(.n-tree-node-switcher--hide) {
+    width: 0 !important;
+    min-width: 0 !important;
+    margin-right: 0 !important;
+}
+:deep(.n-tree-node-content__prefix) {
+    margin-right: 4px !important;
 }
 
-.title {
-  font-weight: bold;
-  opacity: 0.8;
+.toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.toolbar-left {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+
+.display-options {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
 }
 
 .search-box {
-    flex-shrink: 0;
+  flex-shrink: 0;
 }
 
 .tree-container {

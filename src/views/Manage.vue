@@ -96,7 +96,7 @@ onMounted(() => {
       <NLayoutSider
         bordered
         width="240"
-        content-style="padding: 12px; display: flex; flex-direction: column;"
+        content-style="padding: 12px 12px 12px 8px; display: flex; flex-direction: column;"
       >
         <div class="sider-header">
            <NButton text @click="goBack" class="back-btn">← {{ t('manage.back') }}</NButton>
@@ -191,6 +191,7 @@ onMounted(() => {
     margin-bottom: 12px;
 }
 .back-btn {
+    padding: 0;
     margin-bottom: 8px;
     font-size: 0.9em;
     opacity: 0.7;

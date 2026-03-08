@@ -2,12 +2,16 @@
 import { ref, watch, computed, h } from 'vue'
 import { 
   NDataTable, NButton, NSpace, NIcon, NPagination, useMessage, useDialog,
-  NModal, NForm, NFormItem, NInput, NInputNumber, NCheckbox, NSelect, NPopover
+  NModal, NForm, NFormItem, NInput, NInputNumber, NCheckbox, NSelect,
+  NDropdown, NInputGroup, NEllipsis
 } from 'naive-ui'
 import { 
-  AddOutline, RefreshOutline, TrashOutline, CreateOutline 
+  AddOutline, RefreshOutline, TrashOutline, CreateOutline,
+  SearchOutline, DownloadOutline, CloudUploadOutline
 } from '@vicons/ionicons5'
 import { invoke } from '../utils/tauri'
+import { save, open } from '@tauri-apps/plugin-dialog'
+import { writeTextFile, readTextFile } from '@tauri-apps/plugin-fs'
 import { useI18n } from 'vue-i18n'
 import type { ConnectionConfig } from '../types'
 import type { DataTableColumns } from 'naive-ui'
@@ -37,6 +41,10 @@ const pageSizeOptions = [
     { label: '1000 行', value: 1000 }
 ]
 
+// Search state
+const searchKeyword = ref('')
+const searchColumn = ref<string | null>(null) // null = all columns
+
 // CRUD Modal
 const showModal = ref(false)
 const modalMode = ref<'create' | 'edit'>('create')
@@ -49,107 +57,91 @@ const primaryKey = computed(() => {
     return pkCol ? pkCol.name : null
 })
 
-// Columns for the data table
-const tableColumns = computed<DataTableColumns>(() => {
+// Search column options
+const searchColumnOptions = computed(() => {
     return [
-        ...tableMetadata.value.map(col => ({
+        { label: t('manage.all_columns'), value: '__all__' },
+        ...tableMetadata.value.map(col => ({ label: col.name, value: col.name }))
+    ]
+})
+
+const renderColumnSelectLabel = (option: any) => {
+    return h(NEllipsis, { tooltip: true }, { default: () => option.label })
+}
+
+// Export dropdown options
+const exportOptions = [
+    { label: 'CSV', key: 'csv' },
+    { label: 'JSON', key: 'json' },
+    { label: 'SQL (INSERT)', key: 'sql' }
+]
+
+const tableColumns = ref<DataTableColumns>([])
+
+// Update columns definition whenever table metadata changes
+watch(tableMetadata, (newMeta) => {
+    tableColumns.value = [
+        ...newMeta.map(col => ({
             title() {
-                // Custom header render to show comment
-                return h('div', { style: 'display: flex; flex-direction: column; align-items: start;' }, [
-                    h('span', { style: 'font-weight: 500;' }, col.name),
-                    col.comment ? h('span', { style: 'font-size: 12px; color: #999; margin-top: 2px;' }, col.comment) : null
+                return h('div', { style: 'display: flex; flex-direction: column; align-items: start; width: 100%; overflow: hidden;' }, [
+                    h(NEllipsis, { tooltip: true, style: 'font-weight: 500; max-width: 100%;' }, { default: () => col.name }),
+                    col.comment ? h(NEllipsis, { tooltip: true, style: 'font-size: 12px; color: #999; margin-top: 2px; max-width: 100%;' }, { default: () => col.comment }) : null
                 ])
             },
             key: col.name,
-            width: 150,
-            // Disable default ellipsis tooltip for JSON/Text types, let our custom renderer handle it
-            ellipsis: !['json', 'text'].some(t => col.type_name?.toLowerCase().includes(t)) ? { tooltip: true } : undefined,
+            resizable: true,
+            minWidth: 50,
+            maxWidth: 1000,
+            width: Math.max(120, Math.min(300, col.name.length * 10 + 40)),
+            ellipsis: { tooltip: true },
             sorter: true,
             sortOrder: sortColumn.value === col.name ? sortOrder.value : false,
             render(row: any) {
                 let val = row[col.name];
                 
-                // Try to detect and parse JSON strings (in TEXT/VARCHAR fields too)
-                let parsedJson = null;
-                if (typeof val === 'string' && val.trim()) {
-                    const trimmed = val.trim();
-                    // Check if it looks like JSON (starts with { or [)
-                    if ((trimmed.startsWith('{') && trimmed.endsWith('}')) || 
-                        (trimmed.startsWith('[') && trimmed.endsWith(']'))) {
-                        try {
-                            parsedJson = JSON.parse(val);
-                        } catch (e) {
-                            // Not valid JSON, treat as regular string
-                        }
-                    }
-                }
-                
-                // Use parsed JSON if available
-                if (parsedJson !== null) {
-                    val = parsedJson;
-                }
-
                 if (val === null) {
                     return h('span', { style: 'color: #ccc; font-style: italic;' }, '[NULL]')
                 }
 
-                // Render as JSON popover if it's an object or was detected as JSON
+                let isJson = false;
                 if (typeof val === 'object' && val !== null) {
+                    isJson = true;
+                } else if (typeof val === 'string' && val.trim()) {
+                    const trimmed = val.trim();
+                    if ((trimmed.startsWith('{') && trimmed.endsWith('}')) || 
+                        (trimmed.startsWith('[') && trimmed.endsWith(']'))) {
+                        try {
+                            val = JSON.parse(val);
+                            isJson = true;
+                        } catch (e) { /* not JSON */ }
+                    }
+                }
+                
+                if (isJson) {
                    const fullStr = JSON.stringify(val);
                    const preview = fullStr.length > 50 ? fullStr.slice(0, 50) + '...' : fullStr;
-                   const formatted = JSON.stringify(val, null, 2);
-                   
-                   return h(NPopover, { 
-                       trigger: 'hover', 
-                       placement: 'right-start', 
-                       style: { padding: 0, backgroundColor: '#e7f5ee', border: '1px solid #18a058' },
-                       arrowStyle: { backgroundColor: '#e7f5ee' }
-                   }, {
-                       trigger: () => h('div', { 
-                           style: 'max-width: 150px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; cursor: pointer; color: #18a058;' 
-                       }, preview),
-                       default: () => h('div', {
-                           style: 'background-color: #e7f5ee; color: #18a058; padding: 12px; border-radius: 4px; max-height: 60vh; max-width: 400px; overflow-y: auto;' 
-                       }, [
-                           h('pre', { 
-                               style: 'margin: 0; font-family: monospace; white-space: pre-wrap; font-size: 12px;' 
-                           }, formatted)
-                       ])
-                   });
+                   return h('span', { 
+                       style: 'color: #18a058; cursor: default;',
+                       title: JSON.stringify(val, null, 2)
+                   }, preview);
                 }
                 
-                // Truncate long text strings (> 100 chars) with hover to see full content
                 if (typeof val === 'string' && val.length > 100) {
-                   const preview = val.slice(0, 80) + '...';
-                   
-                   return h(NPopover, { 
-                       trigger: 'hover', 
-                       placement: 'right-start', 
-                       style: { padding: 0, maxWidth: '500px' }
-                   }, {
-                       trigger: () => h('div', { 
-                           style: 'max-width: 150px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; cursor: pointer; color: #666;' 
-                       }, preview),
-                       default: () => h('div', {
-                           style: 'padding: 12px; max-height: 60vh; max-width: 480px; overflow-y: auto;' 
-                       }, [
-                           h('pre', { 
-                               style: 'margin: 0; white-space: pre-wrap; font-size: 12px; word-break: break-all;' 
-                           }, val)
-                       ])
-                   });
+                   return h('span', { 
+                       style: 'cursor: default;',
+                       title: val 
+                   }, val.slice(0, 80) + '...');
                 }
                 
-                return val;
+                return String(val);
             }
         })),
         {
             title: t('common.edit'), 
             key: 'actions',
-            width: 150,
-            fixed: 'right' as const,
+            width: 120,
             render(row: any) {
-                return h(NSpace, null, {
+                return h(NSpace, { size: 'small' }, {
                     default: () => [
                         h(NButton, {
                             size: 'tiny',
@@ -167,19 +159,42 @@ const tableColumns = computed<DataTableColumns>(() => {
             }
         }
     ]
-})
+}, { immediate: true })
+
+// Handle column width dragging manually if naive-ui needs it
+function handleColumnResized(width: number, colKey: string) {
+    const col = tableColumns.value.find((c: any) => c.key === colKey)
+    if (col) {
+        col.width = width
+    }
+}
+
+// Build WHERE clause from search
+function buildWhereClause(): string {
+    if (!searchKeyword.value.trim()) return ''
+    const keyword = searchKeyword.value.trim().replace(/'/g, "''")
+    
+    if (searchColumn.value && searchColumn.value !== '__all__') {
+        return ` WHERE \`${searchColumn.value}\` LIKE '%${keyword}%'`
+    }
+    
+    // Search all columns
+    const conditions = tableMetadata.value
+        .map(col => `\`${col.name}\` LIKE '%${keyword}%'`)
+        .join(' OR ')
+    return conditions ? ` WHERE (${conditions})` : ''
+}
 
 async function loadSchema() {
     try {
-        const cols = await invoke<any[]>('get_columns', { 
-            config: props.config, 
+        const cols = await invoke<any[]>('get_columns', {
+            config: props.config,
             table: props.table,
-            database: props.database
+            database: props.database || null
         })
         tableMetadata.value = cols
-    } catch (e) {
-        console.error('get_columns error:', e)
-        message.error(t('common.error') + ': ' + String(e))
+    } catch (e: any) {
+        message.error('Failed to load columns: ' + e.toString())
     }
 }
 
@@ -189,27 +204,25 @@ async function loadData() {
         const offset = (page.value - 1) * pageSize.value
         const limit = pageSize.value
         
-        const countQuery = `SELECT COUNT(*) as cx FROM ${props.table}`
-        const countRes = await invoke<any[]>('execute_query', {
-             config: props.config, 
-             query: countQuery 
-        })
-        if (countRes.length > 0) {
-            total.value = Number(countRes[0].cx || countRes[0].count || 0)
-        }
+        const where = buildWhereClause()
+        const countQuery = `SELECT COUNT(*) as cx FROM ${props.table}${where}`
 
-        // Build ORDER BY clause if sorting is active
         let orderBy = ''
         if (sortColumn.value && sortOrder.value) {
             const direction = sortOrder.value === 'ascend' ? 'ASC' : 'DESC'
             orderBy = ` ORDER BY \`${sortColumn.value}\` ${direction}`
         }
 
-        const dataQuery = `SELECT * FROM ${props.table}${orderBy} LIMIT ${limit} OFFSET ${offset}`
-        const rows = await invoke<any[]>('execute_query', {
-             config: props.config,
-             query: dataQuery
-        })
+        const dataQuery = `SELECT * FROM ${props.table}${where}${orderBy} LIMIT ${limit} OFFSET ${offset}`
+
+        const [countRes, rows] = await Promise.all([
+            invoke<any[]>('execute_query', { config: props.config, query: countQuery }),
+            invoke<any[]>('execute_query', { config: props.config, query: dataQuery })
+        ])
+
+        if (countRes.length > 0) {
+            total.value = Number(countRes[0].cx || countRes[0].count || 0)
+        }
         data.value = rows
     } catch (e: any) {
         message.error('Failed to load data: ' + e.toString())
@@ -224,14 +237,20 @@ async function refresh() {
     await loadData()
 }
 
+function handleSearch() {
+    page.value = 1
+    loadData()
+}
+
 watch(() => props.table, () => {
     page.value = 1
+    searchKeyword.value = ''
+    searchColumn.value = null
     refresh()
 }, { immediate: true })
 
 watch(page, loadData)
 
-// Handle server-side sorting
 function handleSorterChange(sorter: { columnKey: string, order: 'ascend' | 'descend' | false } | null) {
     if (sorter && sorter.order) {
         sortColumn.value = sorter.columnKey
@@ -240,7 +259,7 @@ function handleSorterChange(sorter: { columnKey: string, order: 'ascend' | 'desc
         sortColumn.value = null
         sortOrder.value = false
     }
-    page.value = 1 // Reset to first page when sorting
+    page.value = 1
     loadData()
 }
 
@@ -271,7 +290,6 @@ async function handleDelete(row: any) {
     const pk = primaryKey.value
     const val = row[pk]
     
-    // Show confirmation dialog
     dialog.warning({
         title: t('common.delete'),
         content: `确定要删除这条记录吗？(${pk} = ${val})`,
@@ -333,10 +351,200 @@ async function handleSubmit() {
         submitting.value = false
     }
 }
+
+// ============ Export ============
+
+async function handleExport(key: string) {
+    try {
+        // Fetch all data (no pagination limit) with current search
+        const where = buildWhereClause()
+        let orderBy = ''
+        if (sortColumn.value && sortOrder.value) {
+            const direction = sortOrder.value === 'ascend' ? 'ASC' : 'DESC'
+            orderBy = ` ORDER BY \`${sortColumn.value}\` ${direction}`
+        }
+        const query = `SELECT * FROM ${props.table}${where}${orderBy}`
+        const allRows = await invoke<any[]>('execute_query', { config: props.config, query })
+        
+        if (!allRows || allRows.length === 0) {
+            message.warning(t('manage.export_no_data'))
+            return
+        }
+
+        let content = ''
+        const columns = tableMetadata.value.map(c => c.name)
+        let defaultName = ''
+        let filterName = ''
+        let filterExt: string[] = []
+
+        if (key === 'csv') {
+            const header = columns.map(c => `"${c}"`).join(',')
+            const rows = allRows.map(row => 
+                columns.map(col => {
+                    const val = row[col]
+                    if (val === null || val === undefined) return ''
+                    const str = typeof val === 'object' ? JSON.stringify(val) : String(val)
+                    return `"${str.replace(/"/g, '""')}"`
+                }).join(',')
+            )
+            content = [header, ...rows].join('\n')
+            defaultName = `${props.table}.csv`
+            filterName = 'CSV'
+            filterExt = ['csv']
+        } else if (key === 'json') {
+            content = JSON.stringify(allRows, null, 2)
+            defaultName = `${props.table}.json`
+            filterName = 'JSON'
+            filterExt = ['json']
+        } else if (key === 'sql') {
+            const statements = allRows.map(row => {
+                const cols = columns.filter(c => row[c] !== null && row[c] !== undefined)
+                const vals = cols.map(c => {
+                    const v = row[c]
+                    if (typeof v === 'object') return `'${JSON.stringify(v).replace(/'/g, "''")}'`
+                    if (typeof v === 'string') return `'${v.replace(/'/g, "''")}'`
+                    return String(v)
+                })
+                return `INSERT INTO ${props.table} (${cols.map(c => `\`${c}\``).join(', ')}) VALUES (${vals.join(', ')});`
+            })
+            content = statements.join('\n')
+            defaultName = `${props.table}.sql`
+            filterName = 'SQL'
+            filterExt = ['sql']
+        }
+
+        // Use Tauri save dialog
+        const filePath = await save({
+            defaultPath: defaultName,
+            filters: [{ name: filterName, extensions: filterExt }]
+        })
+
+        if (!filePath) return // User cancelled
+
+        await writeTextFile(filePath, content)
+        message.success(t('manage.export_success', { count: allRows.length }))
+    } catch (e: any) {
+        message.error(t('common.error') + ': ' + e.toString())
+    }
+}
+
+// ============ Import ============
+
+async function triggerImport() {
+    try {
+        const filePath = await open({
+            filters: [{ name: 'Data', extensions: ['csv', 'json'] }],
+            multiple: false
+        })
+        if (!filePath) return
+
+        loading.value = true
+        const text = await readTextFile(filePath as string)
+        let rows: Record<string, any>[] = []
+        const path = filePath as string
+        const ext = path.split('.').pop()?.toLowerCase()
+
+        if (ext === 'json') {
+            const parsed = JSON.parse(text)
+            rows = Array.isArray(parsed) ? parsed : [parsed]
+        } else if (ext === 'csv') {
+            rows = parseCSV(text)
+        } else {
+            message.error('支持 CSV / JSON 格式')
+            return
+        }
+
+        if (rows.length === 0) {
+            message.warning('文件中没有数据')
+            return
+        }
+
+        let successCount = 0
+        for (const row of rows) {
+            const cols = Object.keys(row).filter(k => row[k] !== null && row[k] !== undefined && row[k] !== '')
+            if (cols.length === 0) continue
+
+            const vals = cols.map(c => {
+                const v = row[c]
+                if (typeof v === 'object') return `'${JSON.stringify(v).replace(/'/g, "''")}'`
+                if (typeof v === 'string') return `'${v.replace(/'/g, "''")}'`
+                return String(v)
+            })
+            
+            const query = `INSERT INTO ${props.table} (${cols.map(c => `\`${c}\``).join(', ')}) VALUES (${vals.join(', ')})`
+            try {
+                await invoke('execute_query', { config: props.config, query })
+                successCount++
+            } catch (e: any) {
+                console.error(`Import row failed:`, e)
+            }
+        }
+
+        message.success(t('manage.import_success', { count: successCount }))
+        loadData()
+    } catch (e: any) {
+        message.error(t('manage.import_failed') + ': ' + e.toString())
+    } finally {
+        loading.value = false
+    }
+}
+
+function parseCSV(text: string): Record<string, any>[] {
+    const lines = text.split('\n').filter(line => line.trim())
+    if (lines.length < 2) return []
+
+    // Parse header
+    const headers = parseCSVLine(lines[0]!)
+    
+    const result: Record<string, any>[] = []
+    for (let i = 1; i < lines.length; i++) {
+        const values = parseCSVLine(lines[i]!)
+        const row: Record<string, any> = {}
+        headers.forEach((h, idx) => {
+            row[h] = values[idx] !== undefined ? values[idx] : null
+        })
+        result.push(row)
+    }
+    return result
+}
+
+function parseCSVLine(line: string): string[] {
+    const result: string[] = []
+    let current = ''
+    let inQuotes = false
+    
+    for (let i = 0; i < line.length; i++) {
+        const char = line[i]
+        if (inQuotes) {
+            if (char === '"') {
+                if (i + 1 < line.length && line[i + 1] === '"') {
+                    current += '"'
+                    i++
+                } else {
+                    inQuotes = false
+                }
+            } else {
+                current += char
+            }
+        } else {
+            if (char === '"') {
+                inQuotes = true
+            } else if (char === ',') {
+                result.push(current.trim())
+                current = ''
+            } else {
+                current += char
+            }
+        }
+    }
+    result.push(current.trim())
+    return result
+}
 </script>
 
 <template>
   <div class="data-grid">
+      <!-- Toolbar Row 1: Actions -->
       <NSpace justify="space-between" class="toolbar" style="flex-wrap: wrap; gap: 8px;">
           <NSpace>
               <NButton @click="refresh" size="small">
@@ -346,8 +554,40 @@ async function handleSubmit() {
                   <template #icon><NIcon><AddOutline /></NIcon></template>
                   {{ t('manage.add_row') }}
               </NButton>
+              <NDropdown :options="exportOptions" @select="handleExport" trigger="click">
+                  <NButton size="small">
+                      <template #icon><NIcon><DownloadOutline /></NIcon></template>
+                      {{ t('manage.export_table') }}
+                  </NButton>
+              </NDropdown>
+              <NButton size="small" @click="triggerImport">
+                  <template #icon><NIcon><CloudUploadOutline /></NIcon></template>
+                  {{ t('manage.import_table') }}
+              </NButton>
           </NSpace>
           <NSpace align="center">
+              <NInputGroup style="width: 400px;">
+                  <NSelect 
+                    v-model:value="searchColumn" 
+                    :options="searchColumnOptions" 
+                    :render-label="renderColumnSelectLabel"
+                    size="small" 
+                    style="width: 180px;"
+                    :placeholder="t('manage.all_columns')"
+                    clearable
+                  />
+                  <NInput 
+                    v-model:value="searchKeyword" 
+                    size="small" 
+                    :placeholder="t('manage.search_placeholder')"
+                    clearable
+                    @keyup.enter="handleSearch"
+                  >
+                      <template #suffix>
+                          <NIcon :component="SearchOutline" style="cursor: pointer;" @click="handleSearch" />
+                      </template>
+                  </NInput>
+              </NInputGroup>
               <NSelect 
                 v-model:value="pageSize" 
                 :options="pageSizeOptions" 
@@ -378,6 +618,8 @@ async function handleSubmit() {
             :bordered="false"
             :scroll-x="tableMetadata.length * 150 + 100"
             @update:sorter="handleSorterChange"
+            @update:columns="(cols: DataTableColumns) => { tableColumns = cols }"
+            @resizable-column-resize="handleColumnResized"
           />
       </div>
 
@@ -418,7 +660,12 @@ async function handleSubmit() {
 .table-container {
     flex: 1;
     min-height: 0;
-    /* padding-right removed to let table fill space organically */
     box-sizing: border-box;
+}
+:deep(.n-data-table .n-data-table-base-table-body) {
+    will-change: transform;
+}
+:deep(.n-data-table .n-data-table-base-table-header) {
+    will-change: transform;
 }
 </style>

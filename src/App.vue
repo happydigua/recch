@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref, h, computed, onMounted, watch } from 'vue'
-import { RouterView, useRouter } from 'vue-router'
+import { RouterView, useRoute, useRouter } from 'vue-router'
 import { useI18n } from 'vue-i18n'
 import {
   NConfigProvider,
@@ -24,6 +24,7 @@ import {
 } from '@vicons/ionicons5'
 
 const router = useRouter()
+const route = useRoute()
 const { t, locale } = useI18n()
 const collapsed = ref(true)
 
@@ -73,6 +74,9 @@ const isDark = computed(() => {
 })
 
 const currentTheme = computed(() => isDark.value ? darkTheme : null)
+const routerViewContentStyle = computed(() =>
+  route.name === 'Manage' ? 'padding: 0; height: 100%;' : 'padding: 24px;'
+)
 
 function renderIcon(icon: any) {
   return () => h(NIcon, null, { default: () => h(icon) })
@@ -185,7 +189,7 @@ const themeIcon = computed(() => {
                 </NDropdown>
             </div>
           </NLayoutSider>
-          <NLayoutContent content-style="padding: 24px;">
+          <NLayoutContent :content-style="routerViewContentStyle">
             <RouterView />
           </NLayoutContent>
         </NLayout>

@@ -38,6 +38,8 @@
 - **CRUD Operations**: Inline editing, creation, and deletion of records.
 - **Query Console**: Execute raw SQL/Redis commands with syntax highlighting.
 - **Column Comments**: View field descriptions inline (just like DBeaver!).
+- **Database Export / Import**: Run full database export or import directly from the connection list.
+- **Export Progress Feedback**: Large database exports show percentage, current table progress, and support stopping mid-run.
 
 ### 🔒 Secure & Private
 - **100% Local**: All connection credentials stored locally on your machine.
@@ -59,6 +61,14 @@
 | Backend | Rust, Tauri, SQLx, Redis |
 | AI | OpenAI-compatible API (Qwen, GPT, DeepSeek, Ollama, etc.) |
 | Architecture | Local-first, Secure, High-performance |
+
+---
+
+## 🆕 Recent Updates
+
+- Database-level export and import are available from the connection list for MySQL and PostgreSQL.
+- Export progress now shows percentage, current table progress, and a stop button for long-running tasks.
+- Large table export behavior has been improved to keep progress feedback more stable during long runs.
 
 ---
 
@@ -84,7 +94,7 @@ Download the latest release for your platform:
 
 - Node.js (v16+)
 - Rust (Stable)
-- Platform-specific dependencies (see [Tauri Prerequisites](https://tauri.app/v1/guides/getting-started/prerequisites))
+- Platform-specific dependencies (see [Tauri v2 Prerequisites](https://v2.tauri.app/start/prerequisites/))
 
 ### Quick Start
 
@@ -157,6 +167,8 @@ MIT License. See [LICENSE](LICENSE) for details.
 - **CRUD 操作**：行内编辑、创建、删除记录。
 - **查询控制台**：执行原生 SQL/Redis 命令，支持语法高亮。
 - **字段注释显示**：像 DBeaver 一样直接显示字段备注。
+- **数据库级导出 / 导入**：可直接在连接列表里执行整库导出和导入。
+- **导出进度反馈**：大库导出时显示百分比、当前表进度，并支持中途停止。
 
 ### 🔒 安全与隐私
 - **100% 本地化**：所有连接凭证存储在本地。
@@ -178,6 +190,14 @@ MIT License. See [LICENSE](LICENSE) for details.
 | 后端 | Rust、Tauri、SQLx、Redis |
 | AI | OpenAI 兼容 API（通义千问、GPT、DeepSeek、Ollama 等） |
 | 架构 | 本地优先、安全、高性能 |
+
+---
+
+## 🆕 最近更新
+
+- MySQL 和 PostgreSQL 已支持在连接列表中直接进行数据库级导出与导入。
+- 数据库导出现在会显示百分比、当前表进度，并支持手动停止。
+- 大表导出流程已优化，长时间导出时的进度反馈更稳定。
 
 ---
 
@@ -203,7 +223,7 @@ MIT License. See [LICENSE](LICENSE) for details.
 
 - Node.js (v16+)
 - Rust (Stable)
-- 平台特定依赖 (参见 [Tauri 环境准备](https://tauri.app/v1/guides/getting-started/prerequisites))
+- 平台特定依赖 (参见 [Tauri v2 环境准备](https://v2.tauri.app/start/prerequisites/))
 
 ### 快速开始
 

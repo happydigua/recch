@@ -11,6 +11,9 @@ commands.allow = [
     "get_databases",
     "get_columns",
     "execute_query",
+    "export_database_sql",
+    "cancel_database_export",
+    "import_database_sql",
     "alter_table",
     "get_indexes",
     "get_ai_config",
@@ -18,4 +21,3 @@ commands.allow = [
     "generate_sql_from_text",
     "get_redis_key_value"
 ]
-

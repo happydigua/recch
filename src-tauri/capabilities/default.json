@@ -7,6 +7,11 @@
   "permissions": [
     "core:default",
     "opener:default",
-    "allow-db-commands"
+    "allow-db-commands",
+    "dialog:allow-save",
+    "dialog:allow-open",
+    "fs:allow-read-text-file",
+    "fs:allow-write-text-file",
+    "fs:default"
   ]
 }
