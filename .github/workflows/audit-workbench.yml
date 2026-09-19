@@ -33,18 +33,21 @@ jobs:
         run: |
           cargo update --manifest-path src-tauri/Cargo.toml
           cargo fmt --manifest-path src-tauri/Cargo.toml
-      - name: Commit candidate to repair branch only
+      - name: Commit source candidate to repair branch only
         id: commit
         run: |
+          cp .github/workflows/check.yml /tmp/audit/check.yml
+          cp .github/workflows/release.yml /tmp/audit/release.yml
+          git restore --source=HEAD --staged --worktree .github/workflows
           rm -r .audit
-          rm .github/workflows/audit-workbench.yml
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add -A
+          git diff --cached --quiet -- .github/workflows
           git commit -m 'fix: harden database sessions, backups, storage, imports and privacy'
+          git archive --format=zip HEAD -o /tmp/audit/candidate-source.zip
           git push origin HEAD:refs/heads/fix/deep-audit-20260919
           echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
-          git archive --format=zip HEAD -o /tmp/audit/candidate-source.zip
       - uses: actions/upload-artifact@v4
         if: always()
         with:
