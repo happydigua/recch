@@ -1,0 +1,75 @@
+name: Materialize reviewed audit patch
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize]
+permissions:
+  contents: read
+concurrency:
+  group: recch-audit-materialize
+  cancel-in-progress: true
+jobs:
+  materialize:
+    if: github.event.pull_request.head.repo.full_name == 'happydigua/recch' && github.event.pull_request.head.ref == 'fix/audit-sessions-backups-20260919'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+      - name: Install desktop dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev
+      - name: Apply reviewed, baseline-checked patches
+        run: |
+          python .audit_backend.py
+          python .audit_frontend.py
+          python .audit_ai.py
+          python .audit_regressions.py
+      - name: Refresh vulnerable compatible npm dependencies
+        run: npm audit fix --ignore-scripts
+      - run: npm ci
+      - name: Frontend regression tests
+        run: npm test
+      - name: Frontend build
+        run: npm run build
+      - name: Update Rust feature lockfile and compile
+        working-directory: src-tauri
+        run: cargo check
+      - name: Backend unit tests
+        working-directory: src-tauri
+        run: cargo test --locked --lib
+      - name: Prepare final tree for explicit review and connector commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          rm .audit_backend.py .audit_frontend.py .audit_ai.py .audit_regressions.py .github/workflows/audit-materialize.yml
+          python - <<'PY'
+          import json, os, subprocess, urllib.request
+          from pathlib import Path
+          base = subprocess.check_output(['git', 'rev-parse', 'HEAD^{tree}'], text=True).strip()
+          paths = subprocess.check_output(['git', 'diff', '--name-only', '-z', 'HEAD']).decode().split('\0')
+          entries = []
+          for path in filter(None, paths):
+              entry = {'path': path, 'mode': '100644', 'type': 'blob'}
+              if Path(path).exists(): entry['content'] = Path(path).read_text()
+              else: entry['sha'] = None
+              entries.append(entry)
+          body = json.dumps({'base_tree': base, 'tree': entries}).encode()
+          request = urllib.request.Request('https://api.github.com/repos/happydigua/recch/git/trees', data=body, method='POST', headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json', 'Content-Type': 'application/json', 'User-Agent': 'recch-audit-materializer'})
+          with urllib.request.urlopen(request) as response: tree = json.load(response)
+          print('RECCH_FINAL_TREE=' + tree['sha'])
+          print('No branch reference was changed. Explicit review/commit/merge remains required.')
+          for entry in entries: print(('WRITE ' if 'content' in entry else 'REMOVE ') + entry['path'])
+          PY
