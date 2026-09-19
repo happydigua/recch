@@ -320,7 +320,8 @@ async function handleExport(key: string) {
     try {
         if (!schemaReady || !['csv', 'json', 'sql'].includes(key)) return
         const target = captureTarget()
-        const columns = tableMetadata.value.map(c => c.name as string)
+        const metadata = tableMetadata.value.map(column => ({ ...column }))
+        const columns = metadata.map(c => c.name as string)
         const query = `SELECT * FROM ${quoteIdentifier(target.table, target.dialect)}${buildWhereClause(target)}${buildOrderBy(target)}`
         const allRows = await invoke<any[]>('execute_query', { config: target.config, query })
         if (!allRows?.length) { message.warning(t('manage.export_no_data')); return }
@@ -337,7 +338,7 @@ async function handleExport(key: string) {
         } else if (key === 'json') content = JSON.stringify(allRows, null, 2)
         else content = allRows.map(row => {
             const values = Object.fromEntries(columns.map(column => [column, row[column]]))
-            return `${insertQuery(target.table, values, target.dialect, tableMetadata.value)};`
+            return `${insertQuery(target.table, values, target.dialect, metadata)};`
         }).join('\n')
         const filePath = await save({
             defaultPath: `${target.table}.${key}`,

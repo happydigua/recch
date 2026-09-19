@@ -1104,8 +1104,7 @@ async fn import_database_sql(
                 .await?;
             let mut connection = pool.acquire().await.map_err(|e| e.to_string())?.detach();
             let script = native_backup::sql_without_psql_wrapper(&script);
-            let result = raw_sql(&script)
-                .execute(&mut connection)
+            let result = sqlx::Executor::execute(&mut connection, script.as_str())
                 .await
                 .map_err(|e| {
                     format!(
@@ -1119,8 +1118,7 @@ async fn import_database_sql(
             let pool = pool_manager.get_pg_pool(&config, Some(&target_db)).await?;
             let mut connection = pool.acquire().await.map_err(|e| e.to_string())?.detach();
             let script = native_backup::sql_without_psql_wrapper(&script);
-            let result = raw_sql(&script)
-                .execute(&mut connection)
+            let result = sqlx::Executor::execute(&mut connection, script.as_str())
                 .await
                 .map_err(|e| {
                     format!(

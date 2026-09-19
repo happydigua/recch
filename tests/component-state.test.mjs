@@ -195,3 +195,29 @@ test('schema editor blocks stale deletion and combines rename/modify', async () 
     assert.equal(writes[0][1].operation.column_def.name, 'new')
   } finally { component.close() }
 })
+
+
+test('SQL export keeps the original binary metadata while selection changes', async () => {
+  const props = reactive({ config: { ...config }, table: 'source', database: 'first' })
+  let resolveExport
+  let exported
+  const component = setupComponent('../src/components/DataGrid.vue', 'const props =', 'handleExport', {
+    defineProps: () => props,
+    invoke: async (name, args) => {
+      if (name === 'get_columns') return [{ name: 'payload', type_name: props.table === 'source' ? 'bytea' : 'text' }]
+      if (args.query.includes('COUNT(*)')) return [{ cx: 1 }]
+      if (!args.query.includes('LIMIT')) return new Promise(resolve => { resolveExport = resolve })
+      return []
+    },
+    save: async () => '/tmp/export-test.sql',
+    writeTextFile: async (_path, text) => { exported = text }
+  })
+  try {
+    await settle()
+    const pending = component.state.handleExport('sql')
+    props.table = 'other'; await settle()
+    resolveExport([{ payload: '0xAABB' }])
+    await pending
+    assert.equal(exported, 'INSERT INTO "source" ("payload") VALUES (decode(\'AABB\', \'hex\'));')
+  } finally { component.close() }
+})
