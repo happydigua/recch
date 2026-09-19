@@ -1,40 +1,96 @@
 name: Test and Check
 on:
   push:
-    branches: [ main ]
+    branches: [main]
   pull_request:
-    branches: [ main ]
-
+    branches: [main]
+permissions:
+  contents: read
 jobs:
   check:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: integration-only
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U postgres" --health-interval 5s --health-timeout 5s --health-retries 15
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: integration-only
+          MYSQL_ROOT_HOST: '%'
+        ports: ['3306:3306']
+        options: >-
+          --health-cmd "mysqladmin ping -h localhost -pintegration-only" --health-interval 5s --health-timeout 5s --health-retries 20
+      redis:
+        image: redis:7
+        ports: ['6379:6379']
+        options: >-
+          --health-cmd "redis-cli ping" --health-interval 5s --health-timeout 5s --health-retries 15
     steps:
       - uses: actions/checkout@v4
-
+        with:
+          persist-credentials: false
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-
       - uses: dtolnay/rust-toolchain@stable
-
-      - name: install dependencies
+      - name: Install native and test dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev
-
-      - name: install frontend dependencies
-        run: npm ci
-
-      - name: frontend regression tests
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev mysql-client postgresql-client-16 webkit2gtk-driver xvfb dbus-x11
+          echo /usr/lib/postgresql/16/bin >> "$GITHUB_PATH"
+      - run: npm ci
+      - name: Frontend regression tests
         run: npm test
-
-      - name: build frontend
+      - name: Frontend production build
         run: npm run build
-
-      - name: cargo check
+      - name: npm dependency audit
+        run: npm audit --audit-level=moderate
+      - name: Rust compile and unit tests
         working-directory: src-tauri
-        run: cargo check --locked
-
-      - name: backend regression tests
+        run: |
+          cargo check --locked
+          cargo test --locked --lib
+      - name: Isolated database integration tests
         working-directory: src-tauri
-        run: cargo test --locked --lib
+        env:
+          RECCH_INTEGRATION: '1'
+        run: cargo test --locked --lib -- --ignored --test-threads=1
+      - name: Build native desktop without publishing installers
+        run: npm run tauri build -- --debug --no-bundle
+      - name: Native WebView and IPC smoke test
+        env:
+          RECCH_INTEGRATION: '1'
+        run: |
+          cargo install tauri-driver --locked
+          dbus-run-session -- xvfb-run -a python3 tests/desktop_smoke.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: desktop-smoke
+          path: desktop-smoke.png
+          if-no-files-found: ignore
+          retention-days: 3
+  platform-unit-tests:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: dtolnay/rust-toolchain@stable
+      - run: npm ci
+      - run: npm run build
+      - run: cargo test --locked --manifest-path src-tauri/Cargo.toml --lib
