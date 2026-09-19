@@ -10,24 +10,31 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      
+
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
-          
+          node-version: 22
+
       - uses: dtolnay/rust-toolchain@stable
-      
+
       - name: install dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev
-          
+
       - name: install frontend dependencies
-        run: npm install
-        
-      - name: cargo check
-        working-directory: src-tauri
-        run: cargo check
-        
+        run: npm ci
+
+      - name: frontend regression tests
+        run: npm test
+
       - name: build frontend
         run: npm run build
+
+      - name: cargo check
+        working-directory: src-tauri
+        run: cargo check --locked
+
+      - name: backend regression tests
+        working-directory: src-tauri
+        run: cargo test --locked --lib

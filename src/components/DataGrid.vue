@@ -1,11 +1,11 @@
 <script setup lang="ts">
-import { ref, watch, computed, h } from 'vue'
-import { 
+import { ref, watch, computed, h, onBeforeUnmount } from 'vue'
+import {
   NDataTable, NButton, NSpace, NIcon, NPagination, useMessage, useDialog,
   NModal, NForm, NFormItem, NInput, NInputNumber, NCheckbox, NSelect,
   NDropdown, NInputGroup, NEllipsis
 } from 'naive-ui'
-import { 
+import {
   AddOutline, RefreshOutline, TrashOutline, CreateOutline,
   SearchOutline, DownloadOutline, CloudUploadOutline
 } from '@vicons/ionicons5'
@@ -15,6 +15,10 @@ import { writeTextFile, readTextFile } from '@tauri-apps/plugin-fs'
 import { useI18n } from 'vue-i18n'
 import type { ConnectionConfig } from '../types'
 import type { DataTableColumns } from 'naive-ui'
+import {
+  sqlDialect, quoteIdentifier, primaryKeyWhere, insertQuery, updateQuery,
+  deleteQuery, searchWhere, parseCSV
+} from '../utils/dataGrid'
 
 const props = defineProps<{
   config: ConnectionConfig
@@ -26,7 +30,7 @@ const message = useMessage()
 const dialog = useDialog()
 const { t } = useI18n()
 const loading = ref(false)
-const tableMetadata = ref<any[]>([]) 
+const tableMetadata = ref<any[]>([])
 const data = ref<any[]>([])
 const total = ref(0)
 const page = ref(1)
@@ -41,44 +45,45 @@ const pageSizeOptions = [
     { label: '1000 行', value: 1000 }
 ]
 
-// Search state
 const searchKeyword = ref('')
-const searchColumn = ref<string | null>(null) // null = all columns
-
-// CRUD Modal
+const searchColumn = ref<string | null>(null)
 const showModal = ref(false)
 const modalMode = ref<'create' | 'edit'>('create')
 const formData = ref<Record<string, any>>({})
+const originalRow = ref<Record<string, any>>({})
 const submitting = ref(false)
+const primaryKeys = computed(() => tableMetadata.value.filter(c => c.is_pk).map(c => c.name as string))
 
-// Primary Key for edits
-const primaryKey = computed(() => {
-    const pkCol = tableMetadata.value.find(c => c.is_pk)
-    return pkCol ? pkCol.name : null
-})
-
-// Search column options
-const searchColumnOptions = computed(() => {
-    return [
-        { label: t('manage.all_columns'), value: '__all__' },
-        ...tableMetadata.value.map(col => ({ label: col.name, value: col.name }))
-    ]
-})
-
-const renderColumnSelectLabel = (option: any) => {
-    return h(NEllipsis, { tooltip: true }, { default: () => option.label })
+// An async result must never populate a different connection/database/table.
+const targetKey = computed(() => JSON.stringify([props.config, props.database, props.table]))
+let dataRequest = 0
+let schemaReady = false
+let disposed = false
+function captureTarget() {
+    return {
+        key: targetKey.value,
+        table: props.table,
+        config: { ...props.config, database: props.database ?? props.config.database },
+        dialect: sqlDialect(props.config.db_type)
+    }
 }
+type Target = ReturnType<typeof captureTarget>
+let modalTarget: Target | null = null
+function isCurrent(target: Target) { return !disposed && target.key === targetKey.value }
+onBeforeUnmount(() => { disposed = true; dataRequest++ })
 
-// Export dropdown options
+const searchColumnOptions = computed(() => [
+    { label: t('manage.all_columns'), value: '__all__' },
+    ...tableMetadata.value.map(col => ({ label: col.name, value: col.name }))
+])
+const renderColumnSelectLabel = (option: any) => h(NEllipsis, { tooltip: true }, { default: () => option.label })
 const exportOptions = [
     { label: 'CSV', key: 'csv' },
     { label: 'JSON', key: 'json' },
     { label: 'SQL (INSERT)', key: 'sql' }
 ]
-
 const tableColumns = ref<DataTableColumns>([])
 
-// Update columns definition whenever table metadata changes
 watch(tableMetadata, (newMeta) => {
     tableColumns.value = [
         ...newMeta.map(col => ({
@@ -97,63 +102,37 @@ watch(tableMetadata, (newMeta) => {
             sorter: true,
             sortOrder: sortColumn.value === col.name ? sortOrder.value : false,
             render(row: any) {
-                let val = row[col.name];
-                
-                if (val === null) {
-                    return h('span', { style: 'color: #ccc; font-style: italic;' }, '[NULL]')
-                }
-
-                let isJson = false;
-                if (typeof val === 'object' && val !== null) {
-                    isJson = true;
-                } else if (typeof val === 'string' && val.trim()) {
-                    const trimmed = val.trim();
-                    if ((trimmed.startsWith('{') && trimmed.endsWith('}')) || 
-                        (trimmed.startsWith('[') && trimmed.endsWith(']'))) {
-                        try {
-                            val = JSON.parse(val);
-                            isJson = true;
-                        } catch (e) { /* not JSON */ }
+                let val = row[col.name]
+                if (val === null) return h('span', { style: 'color: #ccc; font-style: italic;' }, '[NULL]')
+                let isJson = typeof val === 'object' && val !== null
+                if (typeof val === 'string' && val.trim()) {
+                    const trimmed = val.trim()
+                    if ((trimmed.startsWith('{') && trimmed.endsWith('}')) || (trimmed.startsWith('[') && trimmed.endsWith(']'))) {
+                        try { val = JSON.parse(val); isJson = true } catch { /* not JSON */ }
                     }
                 }
-                
                 if (isJson) {
-                   const fullStr = JSON.stringify(val);
-                   const preview = fullStr.length > 50 ? fullStr.slice(0, 50) + '...' : fullStr;
-                   return h('span', { 
-                       style: 'color: #18a058; cursor: default;',
-                       title: JSON.stringify(val, null, 2)
-                   }, preview);
+                    const fullStr = JSON.stringify(val)
+                    const preview = fullStr.length > 50 ? fullStr.slice(0, 50) + '...' : fullStr
+                    return h('span', { style: 'color: #18a058; cursor: default;', title: JSON.stringify(val, null, 2) }, preview)
                 }
-                
                 if (typeof val === 'string' && val.length > 100) {
-                   return h('span', { 
-                       style: 'cursor: default;',
-                       title: val 
-                   }, val.slice(0, 80) + '...');
+                    return h('span', { style: 'cursor: default;', title: val }, val.slice(0, 80) + '...')
                 }
-                
-                return String(val);
+                return String(val)
             }
         })),
         {
-            title: t('common.edit'), 
+            title: t('common.edit'),
             key: 'actions',
             width: 120,
             render(row: any) {
                 return h(NSpace, { size: 'small' }, {
                     default: () => [
-                        h(NButton, {
-                            size: 'tiny',
-                            quaternary: true,
-                            onClick: () => openEdit(row)
-                        }, { icon: () => h(NIcon, null, { default: () => h(CreateOutline) }) }),
-                        h(NButton, {
-                            size: 'tiny',
-                            quaternary: true,
-                            type: 'error',
-                            onClick: () => handleDelete(row)
-                        }, { icon: () => h(NIcon, null, { default: () => h(TrashOutline) }) })
+                        h(NButton, { size: 'tiny', quaternary: true, onClick: () => openEdit(row) },
+                            { icon: () => h(NIcon, null, { default: () => h(CreateOutline) }) }),
+                        h(NButton, { size: 'tiny', quaternary: true, type: 'error', onClick: () => handleDelete(row) },
+                            { icon: () => h(NIcon, null, { default: () => h(TrashOutline) }) })
                     ]
                 })
             }
@@ -161,384 +140,251 @@ watch(tableMetadata, (newMeta) => {
     ]
 }, { immediate: true })
 
-// Handle column width dragging manually if naive-ui needs it
+watch([sortColumn, sortOrder], () => {
+    for (const column of tableColumns.value as any[]) {
+        if (column.sorter) column.sortOrder = column.key === sortColumn.value ? sortOrder.value : false
+    }
+})
+
 function handleColumnResized(width: number, colKey: string) {
     const col = tableColumns.value.find((c: any) => c.key === colKey)
-    if (col) {
-        col.width = width
-    }
+    if (col) col.width = width
 }
 
-// Build WHERE clause from search
-function buildWhereClause(): string {
-    if (!searchKeyword.value.trim()) return ''
-    const keyword = searchKeyword.value.trim().replace(/'/g, "''")
-    
-    if (searchColumn.value && searchColumn.value !== '__all__') {
-        return ` WHERE \`${searchColumn.value}\` LIKE '%${keyword}%'`
-    }
-    
-    // Search all columns
-    const conditions = tableMetadata.value
-        .map(col => `\`${col.name}\` LIKE '%${keyword}%'`)
-        .join(' OR ')
-    return conditions ? ` WHERE (${conditions})` : ''
+function rowKey(row: Record<string, any>): string {
+    return JSON.stringify(primaryKeys.value.length ? primaryKeys.value.map(key => row[key]) : row)
 }
 
-async function loadSchema() {
+function buildWhereClause(target: Target): string {
+    return searchWhere(tableMetadata.value, searchColumn.value, searchKeyword.value, target.dialect)
+}
+
+function buildOrderBy(target: Target): string {
+    if (!sortColumn.value || !sortOrder.value) return ''
+    if (!tableMetadata.value.some(column => column.name === sortColumn.value)) return ''
+    const direction = sortOrder.value === 'ascend' ? 'ASC' : 'DESC'
+    return ` ORDER BY ${quoteIdentifier(sortColumn.value, target.dialect)} ${direction}`
+}
+
+async function loadSchema(target: Target): Promise<boolean> {
     try {
         const cols = await invoke<any[]>('get_columns', {
-            config: props.config,
-            table: props.table,
-            database: props.database || null
+            config: target.config, table: target.table, database: target.config.database || null
         })
+        if (!isCurrent(target)) return false
         tableMetadata.value = cols
+        schemaReady = true
+        return true
     } catch (e: any) {
-        message.error('Failed to load columns: ' + e.toString())
+        if (isCurrent(target)) message.error('Failed to load columns: ' + e.toString())
+        return false
     }
 }
 
-async function loadData() {
+async function loadData(target = captureTarget()) {
+    if (!schemaReady || !target.table || !isCurrent(target)) return
+    const request = ++dataRequest
     loading.value = true
     try {
         const offset = (page.value - 1) * pageSize.value
-        const limit = pageSize.value
-        
-        const where = buildWhereClause()
-        const countQuery = `SELECT COUNT(*) as cx FROM ${props.table}${where}`
-
-        let orderBy = ''
-        if (sortColumn.value && sortOrder.value) {
-            const direction = sortOrder.value === 'ascend' ? 'ASC' : 'DESC'
-            orderBy = ` ORDER BY \`${sortColumn.value}\` ${direction}`
-        }
-
-        const dataQuery = `SELECT * FROM ${props.table}${where}${orderBy} LIMIT ${limit} OFFSET ${offset}`
-
+        const where = buildWhereClause(target)
+        const table = quoteIdentifier(target.table, target.dialect)
+        const countQuery = `SELECT COUNT(*) as cx FROM ${table}${where}`
+        const dataQuery = `SELECT * FROM ${table}${where}${buildOrderBy(target)} LIMIT ${pageSize.value} OFFSET ${offset}`
         const [countRes, rows] = await Promise.all([
-            invoke<any[]>('execute_query', { config: props.config, query: countQuery }),
-            invoke<any[]>('execute_query', { config: props.config, query: dataQuery })
+            invoke<any[]>('execute_query', { config: target.config, query: countQuery }),
+            invoke<any[]>('execute_query', { config: target.config, query: dataQuery })
         ])
-
-        if (countRes.length > 0) {
-            total.value = Number(countRes[0].cx || countRes[0].count || 0)
-        }
+        if (request !== dataRequest || !isCurrent(target)) return
+        total.value = Number(countRes[0]?.cx ?? countRes[0]?.count ?? 0)
         data.value = rows
     } catch (e: any) {
-        message.error('Failed to load data: ' + e.toString())
+        if (request === dataRequest && isCurrent(target)) message.error('Failed to load data: ' + e.toString())
     } finally {
-        loading.value = false
+        if (request === dataRequest && isCurrent(target)) loading.value = false
     }
 }
 
 async function refresh() {
     if (!props.table) return
-    await loadSchema()
-    await loadData()
+    const target = captureTarget()
+    if (await loadSchema(target)) await loadData(target)
 }
 
 function handleSearch() {
-    page.value = 1
-    loadData()
+    if (page.value !== 1) page.value = 1
+    else void loadData()
 }
 
-watch(() => props.table, () => {
+watch(targetKey, () => {
+    dataRequest++
+    schemaReady = false
+    loading.value = false
+    tableMetadata.value = []
+    data.value = []
+    total.value = 0
     page.value = 1
     searchKeyword.value = ''
     searchColumn.value = null
-    refresh()
+    sortColumn.value = null
+    sortOrder.value = false
+    showModal.value = false
+    modalTarget = null
+    void refresh()
 }, { immediate: true })
-
-watch(page, loadData)
+watch(page, () => { void loadData() })
 
 function handleSorterChange(sorter: { columnKey: string, order: 'ascend' | 'descend' | false } | null) {
-    if (sorter && sorter.order) {
-        sortColumn.value = sorter.columnKey
-        sortOrder.value = sorter.order
-    } else {
-        sortColumn.value = null
-        sortOrder.value = false
-    }
-    page.value = 1
-    loadData()
+    sortColumn.value = sorter?.order ? sorter.columnKey : null
+    sortOrder.value = sorter?.order || false
+    handleSearch()
+}
+
+function editValue(value: any): any {
+    return value !== null && typeof value === 'object' ? JSON.stringify(value) : value
 }
 
 function openCreate() {
+    if (!schemaReady) return
     modalMode.value = 'create'
-    formData.value = {}
-    tableMetadata.value.forEach(col => {
-        formData.value[col.name] = null
-    })
+    modalTarget = captureTarget()
+    formData.value = Object.fromEntries(tableMetadata.value.map(col => [col.name, null]))
+    originalRow.value = {}
     showModal.value = true
 }
 
 function openEdit(row: any) {
-    if (!primaryKey.value) {
-        message.warning('Cannot edit: No Primary Key detected.')
-        return
-    }
-    modalMode.value = 'edit'
-    formData.value = { ...row } 
-    showModal.value = true
+    try {
+        const target = captureTarget()
+        primaryKeyWhere(tableMetadata.value, row, target.dialect)
+        modalMode.value = 'edit'
+        modalTarget = target
+        originalRow.value = { ...row }
+        formData.value = Object.fromEntries(Object.entries(row).map(([key, value]) => [key, editValue(value)]))
+        showModal.value = true
+    } catch (e: any) { message.warning(e.toString()) }
 }
 
-async function handleDelete(row: any) {
-     if (!primaryKey.value) {
-        message.warning('Cannot delete: No Primary Key detected.')
-        return
-    }
-    const pk = primaryKey.value
-    const val = row[pk]
-    
-    dialog.warning({
-        title: t('common.delete'),
-        content: `确定要删除这条记录吗？(${pk} = ${val})`,
-        positiveText: t('common.delete'),
-        negativeText: t('common.cancel'),
-        onPositiveClick: async () => {
-            const valSql = typeof val === 'string' ? `'${val}'` : val
-            const query = `DELETE FROM ${props.table} WHERE ${pk} = ${valSql}`
-            
-            try {
-                loading.value = true
-                await invoke('execute_query', { config: props.config, query })
-                message.success(t('common.success'))
-                loadData()
-            } catch(e: any) {
-                 message.error('Delete failed: ' + e.toString())
-            } finally {
-                loading.value = false
+function handleDelete(row: any) {
+    try {
+        const target = captureTarget()
+        // Build from the original row before the confirmation dialog can outlive it.
+        const query = deleteQuery(target.table, tableMetadata.value, row, target.dialect)
+        const label = primaryKeys.value.map(key => `${key} = ${row[key]}`).join(', ')
+        dialog.warning({
+            title: t('common.delete'),
+            content: `确定要删除这条记录吗？(${label})`,
+            positiveText: t('common.delete'),
+            negativeText: t('common.cancel'),
+            onPositiveClick: async () => {
+                if (!isCurrent(target)) { message.warning('Selection changed; delete cancelled.'); return false }
+                try {
+                    await invoke('execute_query', { config: target.config, query })
+                    message.success(t('common.success'))
+                    await loadData(target)
+                } catch (e: any) { message.error('Delete failed: ' + e.toString()); return false }
             }
-        }
-    })
+        })
+    } catch (e: any) { message.warning(e.toString()) }
 }
 
 async function handleSubmit() {
+    const target = modalTarget
+    if (!target || !isCurrent(target)) { message.warning('Selection changed; save cancelled.'); return }
     submitting.value = true
     try {
+        let query: string
         if (modalMode.value === 'create') {
-            const cols = Object.keys(formData.value).filter(k => formData.value[k] !== null && formData.value[k] !== '')
-            const vals = cols.map(k => {
-                const v = formData.value[k]
-                return typeof v === 'string' ? `'${v.replace(/'/g, "''")}'` : v
-            })
-            
-            const query = `INSERT INTO ${props.table} (${cols.join(', ')}) VALUES (${vals.join(', ')})`
-            await invoke('execute_query', { config: props.config, query })
-            message.success(t('common.success'))
+            // Untouched null fields use database defaults; an entered empty string is data.
+            const values = Object.fromEntries(Object.entries(formData.value).filter(([, value]) => value !== null))
+            query = insertQuery(target.table, values, target.dialect)
         } else {
-            const pk = primaryKey.value!
-            const pkVal = formData.value[pk]
-            const pkValSql = typeof pkVal === 'string' ? `'${pkVal}'` : pkVal
-            
-            const updates = Object.keys(formData.value)
-                .filter(k => k !== pk)
-                .map(k => {
-                    const v = formData.value[k]
-                    const vSql = v === null ? 'NULL' : (typeof v === 'string' ? `'${v.replace(/'/g, "''")}'` : v)
-                    return `${k} = ${vSql}`
-                })
-            
-            const query = `UPDATE ${props.table} SET ${updates.join(', ')} WHERE ${pk} = ${pkValSql}`
-             await invoke('execute_query', { config: props.config, query })
-             message.success(t('common.success'))
+            const values = Object.fromEntries(Object.entries(formData.value).filter(([key, value]) =>
+                !primaryKeys.value.includes(key) && value !== editValue(originalRow.value[key])
+            ))
+            if (!Object.keys(values).length) { showModal.value = false; return }
+            query = updateQuery(target.table, tableMetadata.value, originalRow.value, values, target.dialect)
         }
-        showModal.value = false
-        loadData()
+        await invoke('execute_query', { config: target.config, query })
+        message.success(t('common.success'))
+        if (isCurrent(target)) showModal.value = false
+        await loadData(target)
     } catch (e: any) {
         message.error(t('common.error') + ': ' + e.toString())
-    } finally {
-        submitting.value = false
-    }
+    } finally { submitting.value = false }
 }
-
-// ============ Export ============
 
 async function handleExport(key: string) {
     try {
-        // Fetch all data (no pagination limit) with current search
-        const where = buildWhereClause()
-        let orderBy = ''
-        if (sortColumn.value && sortOrder.value) {
-            const direction = sortOrder.value === 'ascend' ? 'ASC' : 'DESC'
-            orderBy = ` ORDER BY \`${sortColumn.value}\` ${direction}`
-        }
-        const query = `SELECT * FROM ${props.table}${where}${orderBy}`
-        const allRows = await invoke<any[]>('execute_query', { config: props.config, query })
-        
-        if (!allRows || allRows.length === 0) {
-            message.warning(t('manage.export_no_data'))
-            return
-        }
-
+        if (!schemaReady || !['csv', 'json', 'sql'].includes(key)) return
+        const target = captureTarget()
+        const columns = tableMetadata.value.map(c => c.name as string)
+        const query = `SELECT * FROM ${quoteIdentifier(target.table, target.dialect)}${buildWhereClause(target)}${buildOrderBy(target)}`
+        const allRows = await invoke<any[]>('execute_query', { config: target.config, query })
+        if (!allRows?.length) { message.warning(t('manage.export_no_data')); return }
         let content = ''
-        const columns = tableMetadata.value.map(c => c.name)
-        let defaultName = ''
-        let filterName = ''
-        let filterExt: string[] = []
-
         if (key === 'csv') {
-            const header = columns.map(c => `"${c}"`).join(',')
-            const rows = allRows.map(row => 
-                columns.map(col => {
-                    const val = row[col]
-                    if (val === null || val === undefined) return ''
-                    const str = typeof val === 'object' ? JSON.stringify(val) : String(val)
-                    return `"${str.replace(/"/g, '""')}"`
-                }).join(',')
-            )
+            const csvField = (value: string) => `"${value.replace(/"/g, '""')}"`
+            const header = columns.map(csvField).join(',')
+            const rows = allRows.map(row => columns.map(col => {
+                const value = row[col]
+                if (value === null || value === undefined) return ''
+                return csvField(typeof value === 'object' ? JSON.stringify(value) : String(value))
+            }).join(','))
             content = [header, ...rows].join('\n')
-            defaultName = `${props.table}.csv`
-            filterName = 'CSV'
-            filterExt = ['csv']
-        } else if (key === 'json') {
-            content = JSON.stringify(allRows, null, 2)
-            defaultName = `${props.table}.json`
-            filterName = 'JSON'
-            filterExt = ['json']
-        } else if (key === 'sql') {
-            const statements = allRows.map(row => {
-                const cols = columns.filter(c => row[c] !== null && row[c] !== undefined)
-                const vals = cols.map(c => {
-                    const v = row[c]
-                    if (typeof v === 'object') return `'${JSON.stringify(v).replace(/'/g, "''")}'`
-                    if (typeof v === 'string') return `'${v.replace(/'/g, "''")}'`
-                    return String(v)
-                })
-                return `INSERT INTO ${props.table} (${cols.map(c => `\`${c}\``).join(', ')}) VALUES (${vals.join(', ')});`
-            })
-            content = statements.join('\n')
-            defaultName = `${props.table}.sql`
-            filterName = 'SQL'
-            filterExt = ['sql']
-        }
-
-        // Use Tauri save dialog
+        } else if (key === 'json') content = JSON.stringify(allRows, null, 2)
+        else content = allRows.map(row => {
+            const values = Object.fromEntries(columns.map(column => [column, row[column]]))
+            return `${insertQuery(target.table, values, target.dialect)};`
+        }).join('\n')
         const filePath = await save({
-            defaultPath: defaultName,
-            filters: [{ name: filterName, extensions: filterExt }]
-        })
-
-        if (!filePath) return // User cancelled
-
-        await writeTextFile(filePath, content)
-        message.success(t('manage.export_success', { count: allRows.length }))
-    } catch (e: any) {
-        message.error(t('common.error') + ': ' + e.toString())
-    }
-}
-
-// ============ Import ============
-
-async function triggerImport() {
-    try {
-        const filePath = await open({
-            filters: [{ name: 'Data', extensions: ['csv', 'json'] }],
-            multiple: false
+            defaultPath: `${target.table}.${key}`,
+            filters: [{ name: key.toUpperCase(), extensions: [key] }]
         })
         if (!filePath) return
+        await writeTextFile(filePath, content)
+        message.success(t('manage.export_success', { count: allRows.length }))
+    } catch (e: any) { message.error(t('common.error') + ': ' + e.toString()) }
+}
 
+async function triggerImport() {
+    if (!schemaReady) return
+    const target = captureTarget()
+    const columnNames = new Set(tableMetadata.value.map(column => column.name))
+    let successCount = 0
+    try {
+        const filePath = await open({ filters: [{ name: 'Data', extensions: ['csv', 'json'] }], multiple: false })
+        if (!filePath) return
+        if (!isCurrent(target)) throw new Error('Selection changed; import cancelled')
         loading.value = true
         const text = await readTextFile(filePath as string)
-        let rows: Record<string, any>[] = []
-        const path = filePath as string
-        const ext = path.split('.').pop()?.toLowerCase()
-
+        const ext = (filePath as string).split('.').pop()?.toLowerCase()
+        let rows: Record<string, any>[]
         if (ext === 'json') {
             const parsed = JSON.parse(text)
             rows = Array.isArray(parsed) ? parsed : [parsed]
-        } else if (ext === 'csv') {
-            rows = parseCSV(text)
-        } else {
-            message.error('支持 CSV / JSON 格式')
-            return
-        }
-
-        if (rows.length === 0) {
-            message.warning('文件中没有数据')
-            return
-        }
-
-        let successCount = 0
-        for (const row of rows) {
-            const cols = Object.keys(row).filter(k => row[k] !== null && row[k] !== undefined && row[k] !== '')
-            if (cols.length === 0) continue
-
-            const vals = cols.map(c => {
-                const v = row[c]
-                if (typeof v === 'object') return `'${JSON.stringify(v).replace(/'/g, "''")}'`
-                if (typeof v === 'string') return `'${v.replace(/'/g, "''")}'`
-                return String(v)
-            })
-            
-            const query = `INSERT INTO ${props.table} (${cols.map(c => `\`${c}\``).join(', ')}) VALUES (${vals.join(', ')})`
-            try {
-                await invoke('execute_query', { config: props.config, query })
-                successCount++
-            } catch (e: any) {
-                console.error(`Import row failed:`, e)
-            }
-        }
-
-        message.success(t('manage.import_success', { count: successCount }))
-        loadData()
-    } catch (e: any) {
-        message.error(t('manage.import_failed') + ': ' + e.toString())
-    } finally {
-        loading.value = false
-    }
-}
-
-function parseCSV(text: string): Record<string, any>[] {
-    const lines = text.split('\n').filter(line => line.trim())
-    if (lines.length < 2) return []
-
-    // Parse header
-    const headers = parseCSVLine(lines[0]!)
-    
-    const result: Record<string, any>[] = []
-    for (let i = 1; i < lines.length; i++) {
-        const values = parseCSVLine(lines[i]!)
-        const row: Record<string, any> = {}
-        headers.forEach((h, idx) => {
-            row[h] = values[idx] !== undefined ? values[idx] : null
+        } else if (ext === 'csv') rows = parseCSV(text)
+        else throw new Error('支持 CSV / JSON 格式')
+        if (!rows.length) { message.warning('文件中没有数据'); return }
+        // Validate the entire input before the first write. Do not omit null/empty data.
+        const queries = rows.map(row => {
+            if (!row || typeof row !== 'object' || Array.isArray(row)) throw new Error('Each imported row must be an object')
+            const unknown = Object.keys(row).filter(name => !columnNames.has(name))
+            if (unknown.length) throw new Error(`Unknown columns: ${unknown.join(', ')}`)
+            return insertQuery(target.table, row, target.dialect)
         })
-        result.push(row)
-    }
-    return result
-}
-
-function parseCSVLine(line: string): string[] {
-    const result: string[] = []
-    let current = ''
-    let inQuotes = false
-    
-    for (let i = 0; i < line.length; i++) {
-        const char = line[i]
-        if (inQuotes) {
-            if (char === '"') {
-                if (i + 1 < line.length && line[i + 1] === '"') {
-                    current += '"'
-                    i++
-                } else {
-                    inQuotes = false
-                }
-            } else {
-                current += char
-            }
-        } else {
-            if (char === '"') {
-                inQuotes = true
-            } else if (char === ',') {
-                result.push(current.trim())
-                current = ''
-            } else {
-                current += char
-            }
+        for (const query of queries) {
+            if (!isCurrent(target)) throw new Error('Selection changed; remaining import cancelled')
+            await invoke('execute_query', { config: target.config, query })
+            successCount++
         }
+        message.success(t('manage.import_success', { count: successCount }))
+    } catch (e: any) {
+        // Row-by-row imports are not atomic; report the committed prefix honestly.
+        message.error(`${t('manage.import_failed')}: ${e.toString()} (${successCount} rows imported)`)
+    } finally {
+        if (isCurrent(target)) { loading.value = false; await loadData(target) }
     }
-    result.push(current.trim())
-    return result
 }
 </script>
 
@@ -567,18 +413,18 @@ function parseCSVLine(line: string): string[] {
           </NSpace>
           <NSpace align="center">
               <NInputGroup style="width: 400px;">
-                  <NSelect 
-                    v-model:value="searchColumn" 
-                    :options="searchColumnOptions" 
+                  <NSelect
+                    v-model:value="searchColumn"
+                    :options="searchColumnOptions"
                     :render-label="renderColumnSelectLabel"
-                    size="small" 
+                    size="small"
                     style="width: 180px;"
                     :placeholder="t('manage.all_columns')"
                     clearable
                   />
-                  <NInput 
-                    v-model:value="searchKeyword" 
-                    size="small" 
+                  <NInput
+                    v-model:value="searchKeyword"
+                    size="small"
                     :placeholder="t('manage.search_placeholder')"
                     clearable
                     @keyup.enter="handleSearch"
@@ -588,23 +434,23 @@ function parseCSVLine(line: string): string[] {
                       </template>
                   </NInput>
               </NInputGroup>
-              <NSelect 
-                v-model:value="pageSize" 
-                :options="pageSizeOptions" 
-                size="small" 
+              <NSelect
+                v-model:value="pageSize"
+                :options="pageSizeOptions"
+                size="small"
                 style="width: 100px;"
-                @update:value="() => { page = 1; loadData() }"
+                @update:value="handleSearch"
               />
-              <NPagination 
-                v-model:page="page" 
-                :item-count="total" 
-                :page-size="pageSize" 
-                simple 
+              <NPagination
+                v-model:page="page"
+                :item-count="total"
+                :page-size="pageSize"
+                simple
                 size="small"
               />
           </NSpace>
       </NSpace>
-      
+
       <div class="table-container">
            <NDataTable
             :columns="tableColumns"
@@ -612,7 +458,7 @@ function parseCSVLine(line: string): string[] {
             :loading="loading"
             flex-height
             remote
-            :row-key="(row) => primaryKey ? row[primaryKey] : (row.id || Object.values(row).join('-'))"
+            :row-key="rowKey"
             style="height: 100%"
             size="small"
             :bordered="false"
@@ -633,10 +479,9 @@ function parseCSVLine(line: string): string[] {
                         <span v-if="col.comment" style="color: #999; font-size: 12px;">({{ col.comment }})</span>
                     </NSpace>
                  </template>
-                 <NInput v-if="['VARCHAR', 'TEXT', 'CHAR'].some(t => col.type_name.includes(t))" v-model:value="formData[col.name]"  />
-                 <NInputNumber v-else-if="['INT', 'FLOAT', 'DOUBLE', 'DECIMAL'].some(t => col.type_name.includes(t))" v-model:value="formData[col.name]" />
-                 <NCheckbox v-else-if="['BOOL', 'TINYINT'].some(t => col.type_name.includes(t))" v-model:checked="formData[col.name]" />
-                 <NInput v-else v-model:value="formData[col.name]" placeholder="Raw value" />
+                 <NCheckbox v-if="col.type_name.toUpperCase().includes('BOOL')" v-model:checked="formData[col.name]" :disabled="modalMode === 'edit' && col.is_pk" />
+                 <NInputNumber v-else-if="['INT', 'FLOAT', 'DOUBLE', 'DECIMAL', 'NUMERIC', 'REAL'].some(t => col.type_name.toUpperCase().includes(t))" v-model:value="formData[col.name]" :disabled="modalMode === 'edit' && col.is_pk" />
+                 <NInput v-else v-model:value="formData[col.name]" :disabled="modalMode === 'edit' && col.is_pk" placeholder="Raw value" />
              </NFormItem>
         </NForm>
         <template #action>
