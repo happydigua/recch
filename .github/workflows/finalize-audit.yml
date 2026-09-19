@@ -1,0 +1,78 @@
+name: Apply audit regression corrections
+on:
+  push:
+    branches: [fix/deep-audit-20260919]
+permissions:
+  contents: read
+jobs:
+  corrections:
+    if: github.repository == 'happydigua/recch' && github.ref == 'refs/heads/fix/deep-audit-20260919'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Apply narrowly scoped corrections with baseline checks
+        shell: python
+        run: |
+          from pathlib import Path
+          import hashlib
+          expected = {
+              'src-tauri/src/lib.rs': 'd199e6c55a4d61ab3db191035c6d882bcb1f94b1e659f4e5abb23912a7a2c966',
+              'src/components/DataGrid.vue': '005976037dd7bdd1a6ed8d5e9f8c5884e37559d9cd0ee6d720619ee0244b9b1d',
+              'tests/component-state.test.mjs': 'b2530e58ec255be762958ca5d7695017ec6f1a75bd87ad163ae8316fd6881412',
+          }
+          for file, digest in expected.items():
+              assert hashlib.sha256(Path(file).read_bytes()).hexdigest() == digest, file
+          path = Path('src-tauri/src/lib.rs')
+          text = path.read_text()
+          before = 'let result = raw_sql(&script)\n                .execute(&mut connection)'
+          assert text.count(before) == 2
+          text = text.replace(before, 'let result = sqlx::Executor::execute(&mut connection, script.as_str())')
+          path.write_text(text)
+          path = Path('src/components/DataGrid.vue')
+          text = path.read_text()
+          before = 'const columns = tableMetadata.value.map(c => c.name as string)'
+          assert text.count(before) == 1
+          text = text.replace(before, 'const metadata = tableMetadata.value.map(column => ({ ...column }))\n        const columns = metadata.map(c => c.name as string)')
+          before = 'insertQuery(target.table, values, target.dialect, tableMetadata.value)};'
+          assert text.count(before) == 1
+          path.write_text(text.replace(before, 'insertQuery(target.table, values, target.dialect, metadata)};'))
+          path = Path('tests/component-state.test.mjs')
+          text = path.read_text()
+          text += r'''
+
+          test('SQL export keeps the original binary metadata while selection changes', async () => {
+            const props = reactive({ config: { ...config }, table: 'source', database: 'first' })
+            let resolveExport
+            let exported
+            const component = setupComponent('../src/components/DataGrid.vue', 'const props =', 'handleExport', {
+              defineProps: () => props,
+              invoke: async (name, args) => {
+                if (name === 'get_columns') return [{ name: 'payload', type_name: props.table === 'source' ? 'bytea' : 'text' }]
+                if (args.query.includes('COUNT(*)')) return [{ cx: 1 }]
+                if (!args.query.includes('LIMIT')) return new Promise(resolve => { resolveExport = resolve })
+                return []
+              },
+              save: async () => '/tmp/export-test.sql',
+              writeTextFile: async (_path, text) => { exported = text }
+            })
+            try {
+              await settle()
+              const pending = component.state.handleExport('sql')
+              props.table = 'other'; await settle()
+              resolveExport([{ payload: '0xAABB' }])
+              await pending
+              assert.equal(exported, 'INSERT INTO "source" ("payload") VALUES (decode(\'AABB\', \'hex\'));')
+            } finally { component.close() }
+          })
+          '''
+          path.write_text(text)
+      - name: Commit only corrected source files
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add src-tauri/src/lib.rs src/components/DataGrid.vue tests/component-state.test.mjs
+          git commit -m 'fix: snapshot export metadata and use Send-compatible SQL script futures'
+          git push origin HEAD:refs/heads/fix/deep-audit-20260919
