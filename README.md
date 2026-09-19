@@ -43,7 +43,7 @@
 
 ### 🔒 Secure & Private
 - **100% Local**: All connection credentials stored locally on your machine.
-- **No Cloud Sync**: Your data never leaves your device.
+- **No Cloud Sync**: Database operations are local to this application. AI generation sends your prompt and selected schema to the configured AI provider only after explicit confirmation.
 - **Open Source**: Fully transparent codebase you can audit and trust.
 
 ### 🖥️ Cross-Platform Native Performance
@@ -92,8 +92,8 @@ Download the latest release for your platform:
 
 ### Prerequisites
 
-- Node.js (v16+)
-- Rust (Stable)
+- Node.js (v22.13+)
+- Rust 1.89+ (Stable)
 - Platform-specific dependencies (see [Tauri v2 Prerequisites](https://v2.tauri.app/start/prerequisites/))
 
 ### Quick Start
@@ -172,7 +172,7 @@ MIT License. See [LICENSE](LICENSE) for details.
 
 ### 🔒 安全与隐私
 - **100% 本地化**：所有连接凭证存储在本地。
-- **无云同步**：数据永远不离开你的设备。
+- **无云同步**：数据库操作由本机发起；AI 生成功能经明确确认后，会将需求和选定表结构发送到配置的 AI 服务。
 - **开源透明**：代码完全开放，值得信赖。
 
 ### 🖥️ 跨平台原生性能
@@ -221,8 +221,8 @@ MIT License. See [LICENSE](LICENSE) for details.
 
 ### 环境要求
 
-- Node.js (v16+)
-- Rust (Stable)
+- Node.js (v22.13+)
+- Rust 1.89+ (Stable)
 - 平台特定依赖 (参见 [Tauri v2 环境准备](https://v2.tauri.app/start/prerequisites/))
 
 ### 快速开始
@@ -266,3 +266,14 @@ MIT 许可证。详见 [LICENSE](LICENSE)。
 <div align="center">
   <p>Made with ❤️ by <a href="https://github.com/happydigua">happydigua</a></p>
 </div>
+
+## Safety and supported limits / 安全与支持边界
+
+- Connection and AI configuration JSON is replaced atomically, locked against concurrent writers, and owner-only on Unix. This is **not encryption at rest**; Windows access relies on the user-profile directory ACL. Corrupt JSON is reported, never silently reset.
+- Row-file import uses a database transaction (MySQL requires InnoDB); arbitrary SQL-script import is not promised to be transactional because scripts may contain DDL or explicit commits. A network failure during COMMIT can leave the outcome unknown: verify before retrying.
+- Each Redis operation and raw SQL request owns its session. A manual SELECT, MULTI, USE, SET or transaction does not carry over to later requests. Put related commands in one request. Redis key browsing is bounded at 10000 keys; oversized values and unsupported SQL types produce an explicit error instead of truncated backup data.
+- The built-in database SQL exporter is a **limited logical table exporter**, not a replacement for pg_dump/mysqldump. It rejects detected unsupported objects, uses a consistent snapshot for supported transactional tables, and replaces the selected file only on success. Use native database backup tools for full schema, permissions, extension objects, custom sequence options and disaster recovery. Always test restoration into a disposable database.
+- Binary fields cannot be losslessly represented by this grid's generic CSV/JSON import/export or text editor, so those operations are blocked for binary tables. Database-level SQL export writes actual binary literals. Bigint and exact decimals are transported as text to avoid JavaScript rounding.
+- AI responses are untrusted suggestions and are never automatically executed. HTTPS is required except for explicitly configured loopback services.
+
+配置文件并非加密存储；本轮改进不等同于“零风险”认证。整库 SQL 导出仍有明确支持范围，生产备份应使用数据库原生工具，并在独立测试库验证恢复。跨平台单元测试和一次性数据库集成测试不替代真实桌面端到端及大规模压力测试。
