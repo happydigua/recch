@@ -6,6 +6,9 @@ on:
     branches: [main]
 permissions:
   contents: read
+defaults:
+  run:
+    shell: bash
 jobs:
   check:
     runs-on: ubuntu-24.04
@@ -46,7 +49,7 @@ jobs:
           echo /usr/lib/postgresql/16/bin >> "$GITHUB_PATH"
       - run: npm ci
       - name: Frontend regression tests
-        run: npm test
+        run: npm test | tee frontend-tests.log
       - name: Frontend production build
         run: npm run build
       - name: npm dependency audit
@@ -54,26 +57,28 @@ jobs:
       - name: Rust compile and unit tests
         working-directory: src-tauri
         run: |
-          cargo check --locked
-          cargo test --locked --lib
+          cargo check --locked 2>&1 | tee ../cargo-check.log
+          cargo test --locked --lib 2>&1 | tee ../cargo-test.log
       - name: Isolated database integration tests
         working-directory: src-tauri
         env:
           RECCH_INTEGRATION: '1'
-        run: cargo test --locked --lib -- --ignored --test-threads=1
+        run: cargo test --locked --lib -- --ignored --test-threads=1 2>&1 | tee ../integration-tests.log
       - name: Build native desktop without publishing installers
-        run: npm run tauri build -- --debug --no-bundle
+        run: npm run tauri build -- --debug --no-bundle 2>&1 | tee native-build.log
       - name: Native WebView and IPC smoke test
         env:
           RECCH_INTEGRATION: '1'
         run: |
           cargo install tauri-driver --locked
-          dbus-run-session -- xvfb-run -a python3 tests/desktop_smoke.py
+          dbus-run-session -- xvfb-run -a python3 tests/desktop_smoke.py 2>&1 | tee desktop-smoke.log
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: desktop-smoke
-          path: desktop-smoke.png
+          name: linux-validation
+          path: |
+            *.log
+            desktop-smoke.png
           if-no-files-found: ignore
           retention-days: 3
   platform-unit-tests:
@@ -93,4 +98,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - run: npm ci
       - run: npm run build
-      - run: cargo test --locked --manifest-path src-tauri/Cargo.toml --lib
+      - name: Rust platform unit tests
+        run: cargo test --locked --manifest-path src-tauri/Cargo.toml --lib 2>&1 | tee cargo-test.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: validation-${{ matrix.os }}
+          path: cargo-test.log
+          if-no-files-found: ignore
+          retention-days: 3
