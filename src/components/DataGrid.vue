@@ -245,6 +245,7 @@ function editValue(value: any): any {
 }
 
 function openCreate() {
+    if (!guardBinaryValues()) return
     if (!schemaReady) return
     modalMode.value = 'create'
     modalTarget = captureTarget()
@@ -254,18 +255,20 @@ function openCreate() {
 }
 
 function openEdit(row: any) {
+    if (!guardBinaryValues()) return
     try {
         const target = captureTarget()
         primaryKeyWhere(tableMetadata.value, row, target.dialect)
         modalMode.value = 'edit'
         modalTarget = target
         originalRow.value = { ...row }
-        formData.value = Object.fromEntries(Object.entries(row).map(([key, value]) => [key, editValue(value)]))
+        formData.value = Object.fromEntries(Object.entries(row).map(([key, value]) => [key, inputValue(key, value)]))
         showModal.value = true
     } catch (e: any) { message.warning(e.toString()) }
 }
 
 function handleDelete(row: any) {
+    if (!guardBinaryValues()) return
     try {
         const target = captureTarget()
         // Build from the original row before the confirmation dialog can outlive it.
@@ -300,7 +303,7 @@ async function handleSubmit() {
             query = insertQuery(target.table, values, target.dialect)
         } else {
             const values = Object.fromEntries(Object.entries(formData.value).filter(([key, value]) =>
-                !primaryKeys.value.includes(key) && value !== editValue(originalRow.value[key])
+                !primaryKeys.value.includes(key) && value !== inputValue(key, originalRow.value[key])
             ))
             if (!Object.keys(values).length) { showModal.value = false; return }
             query = updateQuery(target.table, tableMetadata.value, originalRow.value, values, target.dialect)
@@ -314,7 +317,19 @@ async function handleSubmit() {
     } finally { submitting.value = false }
 }
 
+function inputValue(name: string, value: any) {
+    const column = tableMetadata.value.find(c => c.name === name)
+    return value !== null && value !== undefined && column && /BIGINT|INT8|DECIMAL|NUMERIC/i.test(column.type_name)
+        ? String(value) : editValue(value)
+}
+function hasBinaryColumns() { return tableMetadata.value.some(c => /binary|blob|bytea|bit\b/i.test(c.type_name)) }
+function guardBinaryValues() {
+    if (!hasBinaryColumns()) return true
+    message.warning('Binary columns require a typed binary workflow. Use the SQL console or database-level SQL export; text import/export/editing is disabled to prevent corruption.')
+    return false
+}
 async function handleExport(key: string) {
+    if (!guardBinaryValues()) return
     try {
         if (!schemaReady || !['csv', 'json', 'sql'].includes(key)) return
         const target = captureTarget()
@@ -348,7 +363,8 @@ async function handleExport(key: string) {
 }
 
 async function triggerImport() {
-    if (!schemaReady) return
+    if (!guardBinaryValues()) return
+    if (!schemaReady || loading.value) return
     const target = captureTarget()
     const columnNames = new Set(tableMetadata.value.map(column => column.name))
     let successCount = 0
@@ -367,21 +383,24 @@ async function triggerImport() {
         else throw new Error('支持 CSV / JSON 格式')
         if (!rows.length) { message.warning('文件中没有数据'); return }
         // Validate the entire input before the first write. Do not omit null/empty data.
-        const queries = rows.map(row => {
+        rows.forEach(row => {
             if (!row || typeof row !== 'object' || Array.isArray(row)) throw new Error('Each imported row must be an object')
             const unknown = Object.keys(row).filter(name => !columnNames.has(name))
             if (unknown.length) throw new Error(`Unknown columns: ${unknown.join(', ')}`)
+            for (const column of tableMetadata.value) {
+                const value = row[column.name]
+                if (typeof value === 'number' && (/BIGINT|INT8|DECIMAL|NUMERIC/i.test(column.type_name) || (Number.isInteger(value) && !Number.isSafeInteger(value)))) {
+                    throw new Error(`Import ${column.name} as a JSON string to preserve exact numeric digits`)
+                }
+            }
             return insertQuery(target.table, row, target.dialect)
         })
-        for (const query of queries) {
-            if (!isCurrent(target)) throw new Error('Selection changed; remaining import cancelled')
-            await invoke('execute_query', { config: target.config, query })
-            successCount++
-        }
+        if (!isCurrent(target)) throw new Error('Selection changed; import cancelled')
+        successCount = await invoke<number>('import_table_rows', { config: target.config, table: target.table, rows })
         message.success(t('manage.import_success', { count: successCount }))
     } catch (e: any) {
-        // Row-by-row imports are not atomic; report the committed prefix honestly.
-        message.error(`${t('manage.import_failed')}: ${e.toString()} (${successCount} rows imported)`)
+        // The backend reports rollback or an uncertain commit; never imply that retry is safe.
+        message.error(`${t('manage.import_failed')}: ${e.toString()}`)
     } finally {
         if (isCurrent(target)) { loading.value = false; await loadData(target) }
     }
@@ -480,7 +499,8 @@ async function triggerImport() {
                     </NSpace>
                  </template>
                  <NCheckbox v-if="col.type_name.toUpperCase().includes('BOOL')" v-model:checked="formData[col.name]" :disabled="modalMode === 'edit' && col.is_pk" />
-                 <NInputNumber v-else-if="['INT', 'FLOAT', 'DOUBLE', 'DECIMAL', 'NUMERIC', 'REAL'].some(t => col.type_name.toUpperCase().includes(t))" v-model:value="formData[col.name]" :disabled="modalMode === 'edit' && col.is_pk" />
+                 <NInput v-else-if="/BIGINT|INT8|DECIMAL|NUMERIC/i.test(col.type_name) || typeof formData[col.name] === 'string'" v-model:value="formData[col.name]" :disabled="modalMode === 'edit' && col.is_pk" />
+                 <NInputNumber v-else-if="['INT', 'FLOAT', 'DOUBLE', 'REAL'].some(t => col.type_name.toUpperCase().includes(t))" v-model:value="formData[col.name]" :disabled="modalMode === 'edit' && col.is_pk" />
                  <NInput v-else v-model:value="formData[col.name]" :disabled="modalMode === 'edit' && col.is_pk" placeholder="Raw value" />
              </NFormItem>
         </NForm>

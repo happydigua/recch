@@ -153,3 +153,21 @@ test('grid binary text import is blocked rather than silently storing preview te
     assert.ok(harness.messages.some(m => m.kind === 'warning'))
   } finally { harness.close() }
 })
+
+
+test('grid refuses binary-primary-key delete instead of matching a textual hex preview', async () => {
+  const props = reactive({config: {...config}, table: 'items', database: 'first'})
+  const writes = []
+  const harness = component('DataGrid', 'handleDelete, openCreate, showModal', props, {
+    invoke: async (cmd, args) => {
+      if (cmd === 'get_columns') return [{...column, name: 'id', type_name: 'bytea', is_pk: true}]
+      if (args.query.startsWith('DELETE')) writes.push(args)
+      return args.query.includes('COUNT(*)') ? [{cx: 0}] : []
+    }
+  })
+  try {
+    await settle(); await harness.state.handleDelete({id: '0xFF'})
+    assert.equal(harness.dialogs.length, 0); assert.equal(writes.length, 0)
+    harness.state.openCreate(); assert.equal(harness.state.showModal.value, false)
+  } finally { harness.close() }
+})

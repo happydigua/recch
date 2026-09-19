@@ -2,10 +2,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use futures_util::TryStreamExt;
 use sqlx::mysql::MySqlConnectOptions;
-use sqlx::mysql::MySqlRow;
 use sqlx::postgres::PgConnectOptions;
-use sqlx::postgres::PgRow;
-use sqlx::raw_sql;
 use sqlx::ConnectOptions;
 use std::fs;
 use std::io::{BufWriter, Write};
@@ -23,9 +20,15 @@ use tokio::sync::RwLock;
 
 mod ai_service;
 mod pool_manager;
+mod storage;
+mod redis_support;
+mod row_values;
+mod table_import;
+mod schema_edits;
+use row_values::{mysql_row_to_json_map, pg_row_to_json_map, mysql_export_values, pg_export_values};
 use pool_manager::PoolManager;
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct ConnectionConfig {
     pub id: String,
     pub name: String,
@@ -73,11 +76,12 @@ impl ExportTaskManager {
         }
     }
 
-    async fn start_task(&self, task_id: &str) -> Arc<AtomicBool> {
+    async fn start_task(&self, task_id: &str) -> Result<Arc<AtomicBool>, String> {
         let cancel_flag = Arc::new(AtomicBool::new(false));
         let mut tasks = self.tasks.write().await;
+        if task_id.is_empty() || tasks.contains_key(task_id) { return Err("Duplicate or empty export task ID".into()); }
         tasks.insert(task_id.to_string(), cancel_flag.clone());
-        cancel_flag
+        Ok(cancel_flag)
     }
 
     async fn cancel_task(&self, task_id: &str) -> bool {
@@ -125,7 +129,6 @@ fn resolve_target_database(
     let db = database
         .or(config.database.as_deref())
         .unwrap_or("")
-        .trim()
         .to_string();
     if db.is_empty() {
         Err("No database selected".to_string())
@@ -153,26 +156,18 @@ fn escape_sql_string(value: &str, db_type: &str) -> String {
 
 fn sql_literal(value: Option<&Value>, db_type: &str) -> String {
     match value {
-        None | Some(Value::Null) => "NULL".to_string(),
-        Some(Value::Bool(v)) => {
+        None | Some(Value::Null) => "NULL".into(),
+        Some(Value::Bool(v)) => if db_type == "mysql" { if *v { "1".into() } else { "0".into() } } else { v.to_string().to_uppercase() },
+        Some(Value::Number(v)) => v.to_string(),
+        Some(v) => {
+            let text = match v { Value::String(v) => v.clone(), _ => v.to_string() };
             if db_type == "mysql" {
-                if *v { "1".to_string() } else { "0".to_string() }
-            } else if *v {
-                "TRUE".to_string()
+                let hex: String = text.as_bytes().iter().map(|b| format!("{b:02X}")).collect();
+                format!("CONVERT(X'{hex}' USING utf8mb4)")
             } else {
-                "FALSE".to_string()
+                format!("E'{}'", text.replace('\\', "\\\\").replace('\'', "''"))
             }
         }
-        Some(Value::Number(v)) => v.to_string(),
-        Some(Value::String(v)) => format!("'{}'", escape_sql_string(v, db_type)),
-        Some(Value::Array(v)) => format!(
-            "'{}'",
-            escape_sql_string(&serde_json::to_string(v).unwrap_or_else(|_| "[]".to_string()), db_type)
-        ),
-        Some(Value::Object(v)) => format!(
-            "'{}'",
-            escape_sql_string(&serde_json::to_string(v).unwrap_or_else(|_| "{}".to_string()), db_type)
-        ),
     }
 }
 
@@ -198,231 +193,6 @@ fn normalize_pg_column_definition(
     )
 }
 
-fn mysql_row_to_json_map(row: &MySqlRow) -> HashMap<String, Value> {
-    let mut map = HashMap::new();
-
-    for col in row.columns() {
-        let name = col.name();
-        let type_name = col.type_info().name();
-
-        let value: Value = match type_name {
-            "BOOLEAN" | "BOOL" => {
-                let v: Option<bool> = row.try_get(col.ordinal()).unwrap_or(None);
-                json!(v)
-            }
-            _ if type_name.starts_with("TINYINT")
-                || type_name.starts_with("SMALLINT")
-                || type_name.starts_with("INT")
-                || type_name.starts_with("INTEGER")
-                || type_name.starts_with("BIGINT")
-                || type_name.starts_with("MEDIUMINT")
-                || type_name == "INT4"
-                || type_name == "INT8" =>
-            {
-                if let Ok(v) = row.try_get::<Option<i64>, _>(col.ordinal()) {
-                    json!(v)
-                } else if let Ok(v) = row.try_get::<Option<u64>, _>(col.ordinal()) {
-                    json!(v)
-                } else if let Ok(v) = row.try_get::<Option<i32>, _>(col.ordinal()) {
-                    json!(v)
-                } else if let Ok(v) = row.try_get::<Option<i8>, _>(col.ordinal()) {
-                    json!(v)
-                } else {
-                    match row.try_get::<Option<String>, _>(col.ordinal()) {
-                        Ok(v) => json!(v),
-                        Err(_) => Value::Null,
-                    }
-                }
-            }
-            "FLOAT" | "DOUBLE" | "REAL" | "NUMERIC" => {
-                let v: Option<f64> = row.try_get(col.ordinal()).unwrap_or(None);
-                json!(v)
-            }
-            "BIT" => {
-                if let Ok(v) = row.try_get::<Option<u64>, _>(col.ordinal()) {
-                    json!(v)
-                } else {
-                    match row.try_get::<Option<Vec<u8>>, _>(col.ordinal()) {
-                        Ok(Some(v)) => {
-                            let hex: String =
-                                v.iter().map(|b| format!("{:02X}", b)).collect();
-                            json!(format!("0x{}", hex))
-                        }
-                        Ok(None) => Value::Null,
-                        Err(_) => Value::Null,
-                    }
-                }
-            }
-            "JSON" => match row.try_get::<Option<serde_json::Value>, _>(col.ordinal()) {
-                Ok(v) => json!(v),
-                Err(_) => Value::Null,
-            },
-            "TIMESTAMP" | "DATETIME" => {
-                match row.try_get::<Option<chrono::NaiveDateTime>, _>(col.ordinal()) {
-                    Ok(Some(v)) => json!(v.to_string()),
-                    Ok(None) => Value::Null,
-                    Err(_) => match row.try_get::<Option<String>, _>(col.ordinal()) {
-                        Ok(v) => json!(v),
-                        Err(_) => Value::Null,
-                    },
-                }
-            }
-            "DATE" => match row.try_get::<Option<chrono::NaiveDate>, _>(col.ordinal()) {
-                Ok(Some(v)) => json!(v.to_string()),
-                Ok(None) => Value::Null,
-                Err(_) => Value::Null,
-            },
-            "TIME" => match row.try_get::<Option<chrono::NaiveTime>, _>(col.ordinal()) {
-                Ok(Some(v)) => json!(v.to_string()),
-                Ok(None) => Value::Null,
-                Err(_) => Value::Null,
-            },
-            "YEAR" => match row.try_get::<Option<i32>, _>(col.ordinal()) {
-                Ok(Some(v)) => json!(v),
-                Ok(None) => Value::Null,
-                Err(_) => match row.try_get::<Option<String>, _>(col.ordinal()) {
-                    Ok(v) => json!(v),
-                    Err(_) => Value::Null,
-                },
-            },
-            _ if type_name.to_uppercase().contains("BINARY")
-                || type_name.to_uppercase().contains("BLOB")
-                || type_name.to_uppercase().contains("BYTEA") =>
-            {
-                match row.try_get::<Option<Vec<u8>>, _>(col.ordinal()) {
-                    Ok(Some(v)) => {
-                        let hex: String =
-                            v.iter().take(32).map(|b| format!("{:02X}", b)).collect();
-                        let suffix = if v.len() > 32 {
-                            format!("... ({} bytes)", v.len())
-                        } else {
-                            String::new()
-                        };
-                        json!(format!("0x{}{}", hex, suffix))
-                    }
-                    Ok(None) => Value::Null,
-                    Err(_) => Value::Null,
-                }
-            }
-            _ => match row.try_get::<Option<String>, _>(col.ordinal()) {
-                Ok(v) => json!(v),
-                Err(_) => match row.try_get::<Option<Vec<u8>>, _>(col.ordinal()) {
-                    Ok(Some(v)) => {
-                        let hex: String =
-                            v.iter().take(16).map(|b| format!("{:02X}", b)).collect();
-                        let suffix = if v.len() > 16 { "..." } else { "" };
-                        json!(format!("[BLOB: 0x{}{}]", hex, suffix))
-                    }
-                    Ok(None) => Value::Null,
-                    Err(_) => Value::Null,
-                },
-            },
-        };
-
-        map.insert(name.to_string(), value);
-    }
-
-    map
-}
-
-fn pg_row_to_json_map(row: &PgRow) -> HashMap<String, Value> {
-    let mut map = HashMap::new();
-
-    for col in row.columns() {
-        let name = col.name();
-        let type_name = col.type_info().name();
-
-        let value: Value = match type_name {
-            "BOOL" => {
-                let v: Option<bool> = row.try_get(col.ordinal()).unwrap_or(None);
-                json!(v)
-            }
-            "INT2" | "INT4" | "INT8" => {
-                let v: Option<i64> = row.try_get(col.ordinal()).unwrap_or(None);
-                json!(v)
-            }
-            "FLOAT4" | "FLOAT8" | "NUMERIC" | "MONEY" => {
-                let v: Option<f64> = row.try_get(col.ordinal()).unwrap_or(None);
-                json!(v)
-            }
-            "TIMESTAMP" | "TIMESTAMPTZ" => {
-                if let Ok(v) = row.try_get::<Option<String>, _>(col.ordinal()) {
-                    json!(v)
-                } else if let Ok(v) =
-                    row.try_get::<Option<chrono::NaiveDateTime>, _>(col.ordinal())
-                {
-                    json!(v.map(|d| d.to_string()))
-                } else if let Ok(v) =
-                    row.try_get::<Option<chrono::DateTime<chrono::Utc>>, _>(col.ordinal())
-                {
-                    json!(v.map(|d| d.to_string()))
-                } else {
-                    Value::Null
-                }
-            }
-            "DATE" => {
-                if let Ok(v) = row.try_get::<Option<String>, _>(col.ordinal()) {
-                    json!(v)
-                } else if let Ok(v) = row.try_get::<Option<chrono::NaiveDate>, _>(col.ordinal()) {
-                    json!(v.map(|d| d.to_string()))
-                } else {
-                    Value::Null
-                }
-            }
-            "TIME" | "TIMETZ" => {
-                if let Ok(v) = row.try_get::<Option<String>, _>(col.ordinal()) {
-                    json!(v)
-                } else if let Ok(v) = row.try_get::<Option<chrono::NaiveTime>, _>(col.ordinal()) {
-                    json!(v.map(|d| d.to_string()))
-                } else {
-                    Value::Null
-                }
-            }
-            "JSON" | "JSONB" => {
-                if let Ok(v) = row.try_get::<Option<serde_json::Value>, _>(col.ordinal()) {
-                    json!(v)
-                } else if let Ok(v) = row.try_get::<Option<String>, _>(col.ordinal()) {
-                    json!(v)
-                } else {
-                    Value::Null
-                }
-            }
-            "BYTEA" | "VARBINARY" | "BINARY" | "BLOB" => {
-                match row.try_get::<Option<Vec<u8>>, _>(col.ordinal()) {
-                    Ok(Some(v)) => {
-                        let hex: String =
-                            v.iter().take(32).map(|b| format!("{:02X}", b)).collect();
-                        let suffix = if v.len() > 32 {
-                            format!("... ({} bytes)", v.len())
-                        } else {
-                            String::new()
-                        };
-                        json!(format!("0x{}{}", hex, suffix))
-                    }
-                    Ok(None) => Value::Null,
-                    Err(_) => Value::Null,
-                }
-            }
-            _ => match row.try_get::<Option<String>, _>(col.ordinal()) {
-                Ok(v) => json!(v),
-                Err(_) => match row.try_get::<Option<Vec<u8>>, _>(col.ordinal()) {
-                    Ok(Some(v)) => {
-                        let hex: String =
-                            v.iter().take(16).map(|b| format!("{:02X}", b)).collect();
-                        let suffix = if v.len() > 16 { "..." } else { "" };
-                        json!(format!("[BLOB: 0x{}{}]", hex, suffix))
-                    }
-                    _ => Value::Null,
-                },
-            },
-        };
-
-        map.insert(name.to_string(), value);
-    }
-
-    map
-}
-
 async fn execute_query_inner(
     pool_manager: &PoolManager,
     config: &ConnectionConfig,
@@ -434,14 +204,16 @@ async fn execute_query_inner(
                 .get_mysql_pool(config, config.database.as_deref())
                 .await?;
 
+            let mut connection = pool.acquire().await.map_err(|e| e.to_string())?;
+            connection.close_on_drop();
             let rows = sqlx::query(query)
-                .fetch_all(&pool)
+                .fetch_all(&mut *connection)
                 .await
                 .map_err(|e| e.to_string())?;
             let mut results = Vec::new();
 
             for row in rows {
-                results.push(mysql_row_to_json_map(&row));
+                results.push(mysql_row_to_json_map(&row)?);
             }
             Ok(results)
         }
@@ -450,37 +222,21 @@ async fn execute_query_inner(
                 .get_pg_pool(config, config.database.as_deref())
                 .await?;
 
+            let mut connection = pool.acquire().await.map_err(|e| e.to_string())?;
+            connection.close_on_drop();
             let rows = sqlx::query(query)
-                .fetch_all(&pool)
+                .fetch_all(&mut *connection)
                 .await
                 .map_err(|e| e.to_string())?;
             let mut results = Vec::new();
 
             for row in rows {
-                results.push(pg_row_to_json_map(&row));
+                results.push(pg_row_to_json_map(&row)?);
             }
             Ok(results)
         }
         "redis" => {
             let mut con = pool_manager.get_redis_conn(config).await?;
-
-            if let Some(db) = &config.database {
-                if !db.is_empty() {
-                    let db_part = db.split_whitespace().next().unwrap_or("");
-                    let db_index: i32 = if db_part.is_empty() {
-                        0
-                    } else if let Some(num_str) = db_part.strip_prefix("db") {
-                        num_str.parse().unwrap_or(0)
-                    } else {
-                        db_part.parse().unwrap_or(0)
-                    };
-                    let _: () = redis::cmd("SELECT")
-                        .arg(db_index)
-                        .query_async(&mut con)
-                        .await
-                        .map_err(|e| e.to_string())?;
-                }
-            }
 
             let mut results = Vec::new();
 
@@ -496,42 +252,7 @@ async fn execute_query_inner(
                 }
             }
 
-            for line in query.lines() {
-                let trimmed = line.trim();
-                if trimmed.is_empty() || trimmed.starts_with("#") || trimmed.starts_with("--") {
-                    continue;
-                }
-
-                let mut args = Vec::new();
-                let mut current = String::new();
-                let mut in_quotes = false;
-                let mut escape = false;
-
-                for c in trimmed.chars() {
-                    if escape {
-                        current.push(c);
-                        escape = false;
-                    } else if c == '\\' {
-                        escape = true;
-                    } else if c == '"' {
-                        in_quotes = !in_quotes;
-                    } else if c.is_whitespace() && !in_quotes {
-                        if !current.is_empty() {
-                            args.push(current.clone());
-                            current.clear();
-                        }
-                    } else {
-                        current.push(c);
-                    }
-                }
-                if !current.is_empty() {
-                    args.push(current);
-                }
-
-                if args.is_empty() {
-                    continue;
-                }
-
+            for args in redis_support::parse_commands(query)? {
                 let cmd_name = &args[0];
                 let mut cmd = redis::cmd(cmd_name);
 
@@ -549,7 +270,9 @@ async fn execute_query_inner(
                         map.insert("error".to_string(), json!(e.to_string()));
                     }
                 }
+                let failed = map.contains_key("error");
                 results.push(map);
+                if failed { break; }
             }
 
             Ok(results)
@@ -633,29 +356,9 @@ async fn test_connection(config: ConnectionConfig) -> Result<String, String> {
             Ok("PostgreSQL 连接成功!".to_string())
         }
         "redis" => {
-            let url = if let Some(pass) = &config.password {
-                format!(
-                    "redis://:{}@{}:{}/{}",
-                    pass,
-                    config.host,
-                    config.port,
-                    config.database.as_deref().unwrap_or("0")
-                )
-            } else {
-                format!(
-                    "redis://{}:{}/{}",
-                    config.host,
-                    config.port,
-                    config.database.as_deref().unwrap_or("0")
-                )
-            };
-
-            let client = redis::Client::open(url).map_err(|e| e.to_string())?;
-            let mut con = client.get_connection().map_err(|e| e.to_string())?;
-            let _: String = redis::cmd("PING")
-                .query(&mut con)
-                .map_err(|e| e.to_string())?;
-            Ok("Redis Connection Successful!".to_string())
+            let mut con = redis_support::connect(&config).await?;
+            let _: String = redis::cmd("PING").query_async(&mut con).await.map_err(|e| e.to_string())?;
+            Ok("Redis Connection Successful!".into())
         }
         _ => Err("Unsupported database type".to_string()),
     }
@@ -671,60 +374,28 @@ fn get_config_path(app_handle: &tauri::AppHandle) -> Result<PathBuf, String> {
 }
 
 #[tauri::command]
-fn save_connection(app_handle: tauri::AppHandle, config: ConnectionConfig) -> Result<(), String> {
+async fn save_connection(pool_manager: tauri::State<'_, PoolManager>, app_handle: tauri::AppHandle, config: ConnectionConfig) -> Result<(), String> {
     let path = get_config_path(&app_handle)?;
-    let mut connections = if path.exists() {
-        let content = fs::read_to_string(&path).map_err(|e| e.to_string())?;
-        serde_json::from_str::<Vec<ConnectionConfig>>(&content).unwrap_or_default()
-    } else {
-        Vec::new()
-    };
-
-    // Update if exists, otherwise push
-    if let Some(idx) = connections.iter().position(|c| c.id == config.id) {
-        connections[idx] = config;
-    } else {
-        connections.push(config);
-    }
-
-    let json = serde_json::to_string_pretty(&connections).map_err(|e| e.to_string())?;
-    fs::write(path, json).map_err(|e| e.to_string())?;
+    let invalidate = config.clone();
+    storage::update_json(&path, |connections: &mut Vec<ConnectionConfig>| {
+        if let Some(index) = connections.iter().position(|c| c.id == config.id) { connections[index] = config; }
+        else { connections.push(config); }
+    })?;
+    pool_manager.remove_pool(&invalidate).await;
     Ok(())
 }
-
 #[tauri::command]
 fn get_connections(app_handle: tauri::AppHandle) -> Result<Vec<ConnectionConfig>, String> {
-    let path = get_config_path(&app_handle)?;
-    if !path.exists() {
-        return Ok(Vec::new());
-    }
-    let content = fs::read_to_string(&path).map_err(|e| e.to_string())?;
-    let connections = serde_json::from_str(&content).unwrap_or_default();
-    Ok(connections)
+    storage::read_json(&get_config_path(&app_handle)?)
 }
-
 #[tauri::command]
-async fn delete_connection(
-    pool_manager: tauri::State<'_, PoolManager>,
-    app_handle: tauri::AppHandle,
-    id: String,
-) -> Result<(), String> {
+async fn delete_connection(pool_manager: tauri::State<'_, PoolManager>, app_handle: tauri::AppHandle, id: String) -> Result<(), String> {
     let path = get_config_path(&app_handle)?;
-    if !path.exists() {
-        return Ok(());
-    }
-    let content = fs::read_to_string(&path).map_err(|e| e.to_string())?;
-    let mut connections: Vec<ConnectionConfig> = serde_json::from_str(&content).unwrap_or_default();
-
-    // Clean up pool for deleted connection
-    if let Some(config) = connections.iter().find(|c| c.id == id) {
-        pool_manager.remove_pool(config).await;
-    }
-
-    connections.retain(|c| c.id != id);
-
-    let json = serde_json::to_string_pretty(&connections).map_err(|e| e.to_string())?;
-    fs::write(path, json).map_err(|e| e.to_string())?;
+    let removed = storage::update_json(&path, |connections: &mut Vec<ConnectionConfig>| {
+        let removed = connections.iter().find(|c| c.id == id).cloned();
+        connections.retain(|c| c.id != id); removed
+    })?;
+    if let Some(config) = removed { pool_manager.remove_pool(&config).await; }
     Ok(())
 }
 
@@ -752,26 +423,22 @@ async fn get_databases(
             Ok(dbs)
         }
         "redis" => {
-            // Redis has 16 databases by default (0-15)
-            // Query each one for key count using DBSIZE
-            let mut con = pool_manager.get_redis_conn(&config).await?;
-
-            let mut dbs = Vec::new();
-            for i in 0..16 {
-                // Select db
-                let _: () = redis::cmd("SELECT")
-                    .arg(i)
-                    .query_async(&mut con)
-                    .await
-                    .map_err(|e| e.to_string())?;
-                // Get key count
-                let count: i64 = redis::cmd("DBSIZE")
-                    .query_async(&mut con)
-                    .await
-                    .unwrap_or(0);
-                dbs.push(format!("db{} ({})", i, count));
+            let selected = redis_support::selected_config(&config, Some("0"))?;
+            let mut con = pool_manager.get_redis_conn(&selected).await?;
+            let settings: Result<Vec<String>, _> = redis::cmd("CONFIG").arg("GET").arg("databases").query_async(&mut con).await;
+            let count: usize = settings.ok().and_then(|v| v.get(1).and_then(|s| s.parse::<usize>().ok())).unwrap_or(16);
+            if count > 1024 { return Err("Redis browser supports up to 1024 databases".into()); }
+            let mut databases = Vec::new();
+            for index in 0..count {
+                let select: Result<(), _> = redis::cmd("SELECT").arg(index).query_async(&mut con).await;
+                if let Err(error) = select {
+                    if error.to_string().contains("DB index is out of range") { break; }
+                    return Err(error.to_string());
+                }
+                let size: i64 = redis::cmd("DBSIZE").query_async(&mut con).await.map_err(|e| e.to_string())?;
+                databases.push(format!("db{index} ({size})"));
             }
-            Ok(dbs)
+            Ok(databases)
         }
         _ => Err("Unsupported database type for databases".to_string()),
     }
@@ -885,31 +552,9 @@ async fn get_tables(
             Ok(tables)
         }
         "redis" => {
-            let mut con = pool_manager.get_redis_conn(&config).await?;
-
-            // Select DB if provided (database param could be "db0 (15)", "db0", "0", or empty)
-            let db_str = database.or(config.database.clone()).unwrap_or_default();
-            // Extract just the db part before any space (for "db0 (15)" -> "db0")
-            let db_part = db_str.split_whitespace().next().unwrap_or("");
-            let db_index: i32 = if db_part.is_empty() {
-                0
-            } else if let Some(num_str) = db_part.strip_prefix("db") {
-                num_str.parse().unwrap_or(0)
-            } else {
-                db_part.parse().unwrap_or(0)
-            };
-            let _: () = redis::cmd("SELECT")
-                .arg(db_index)
-                .query_async(&mut con)
-                .await
-                .map_err(|e| e.to_string())?;
-
-            // Get all keys (limited to 1000 for performance)
-            let keys: Vec<String> = redis::cmd("KEYS")
-                .arg("*")
-                .query_async(&mut con)
-                .await
-                .map_err(|e| e.to_string())?;
+            let selected = redis_support::selected_config(&config, database.as_deref())?;
+            let mut con = pool_manager.get_redis_conn(&selected).await?;
+            let keys = redis_support::scan_keys(&mut con).await?;
 
             let tables = keys
                 .into_iter()
@@ -1044,24 +689,20 @@ async fn get_columns(
             let pool = pool_manager.get_pg_pool(&config, target_db).await?;
 
             let query = "
-                SELECT 
-                    c.column_name, 
-                    c.data_type,
-                    CASE WHEN tc.constraint_type = 'PRIMARY KEY' THEN true ELSE false END as is_pk,
-                    c.is_nullable, 
-                    c.column_default,
-                    pg_catalog.col_description(format('%s.%s', c.table_schema, c.table_name)::regclass::oid, c.ordinal_position) as comment
+                SELECT c.column_name, pg_catalog.format_type(attr.atttypid, attr.atttypmod),
+                    EXISTS (SELECT 1 FROM information_schema.table_constraints tc
+                      JOIN information_schema.key_column_usage kcu
+                        ON tc.constraint_catalog=kcu.constraint_catalog AND tc.constraint_schema=kcu.constraint_schema
+                        AND tc.constraint_name=kcu.constraint_name AND tc.table_name=kcu.table_name
+                      WHERE tc.constraint_type='PRIMARY KEY' AND tc.table_schema=c.table_schema
+                        AND tc.table_name=c.table_name AND kcu.column_name=c.column_name) AS is_pk,
+                    c.is_nullable, c.column_default,
+                    pg_catalog.col_description(format('%I.%I', c.table_schema, c.table_name)::regclass::oid, c.ordinal_position)
                 FROM information_schema.columns c
-                LEFT JOIN information_schema.key_column_usage kcu 
-                    ON c.table_schema = kcu.table_schema 
-                    AND c.table_name = kcu.table_name 
-                    AND c.column_name = kcu.column_name
-                LEFT JOIN information_schema.table_constraints tc 
-                    ON kcu.constraint_name = tc.constraint_name 
-                    AND kcu.table_schema = tc.table_schema
-                    AND tc.constraint_type = 'PRIMARY KEY'
-                WHERE c.table_schema = 'public' AND c.table_name = $1
-                ORDER BY c.ordinal_position
+                JOIN pg_namespace ns ON ns.nspname=c.table_schema
+                JOIN pg_class rel ON rel.relnamespace=ns.oid AND rel.relname=c.table_name
+                JOIN pg_attribute attr ON attr.attrelid=rel.oid AND attr.attname=c.column_name
+                WHERE c.table_schema='public' AND c.table_name=$1 ORDER BY c.ordinal_position
             ";
             let rows: Vec<(
                 String,
@@ -1090,25 +731,8 @@ async fn get_columns(
             Ok(result)
         }
         "redis" => {
-            let mut con = pool_manager.get_redis_conn(&config).await?;
-
-            // Select DB
-            if let Some(db) = &database.or(config.database.clone()) {
-                if !db.is_empty() {
-                    let db_part = db.split_whitespace().next().unwrap_or("");
-                    let db_index: i32 = if let Some(num_str) = db_part.strip_prefix("db") {
-                        num_str.parse().unwrap_or(0)
-                    } else {
-                        db_part.parse().unwrap_or(0)
-                    };
-                    let _: () = redis::cmd("SELECT")
-                        .arg(db_index)
-                        .query_async(&mut con)
-                        .await
-                        .map_err(|e| e.to_string())?;
-                }
-            }
-
+            let selected = redis_support::selected_config(&config, database.as_deref())?;
+            let mut con = pool_manager.get_redis_conn(&selected).await?;
             // Get key type
             let key_type: String = redis::cmd("TYPE")
                 .arg(&table)
@@ -1190,50 +814,17 @@ async fn get_indexes(
             Ok(indexes)
         }
         "postgresql" => {
-            let pool = pool_manager
-                .get_pg_pool(&config, config.database.as_deref())
-                .await?;
-
-            let rows: Vec<(String, String, bool)> = sqlx::query_as(
-                "
-                select
-                    i.relname as index_name,
-                    array_to_string(array_agg(a.attname), ',') as column_names,
-                    ix.indisunique as is_unique
-                from
-                    pg_class t,
-                    pg_class i,
-                    pg_index ix,
-                    pg_attribute a
-                where
-                    t.oid = ix.indrelid
-                    and i.oid = ix.indexrelid
-                    and a.attrelid = t.oid
-                    and a.attnum = ANY(ix.indkey)
-                    and t.relkind = 'r'
-                    and t.relname = $1
-                group by
-                    t.relname,
-                    i.relname,
-                    ix.indisunique
-            ",
-            )
-            .bind(&table)
-            .fetch_all(&pool)
-            .await
-            .map_err(|e| e.to_string())?;
-
-            let mut indexes = Vec::new();
-            for (name, cols, unique) in rows {
-                indexes.push(IndexDef {
-                    name: name.clone(),
-                    columns: cols.split(',').map(|s| s.to_string()).collect(),
-                    is_unique: unique,
-                    is_pk: name.ends_with("_pkey"), // Heuristic or check indisprimary?
-                    comment: None,
-                });
-            }
-            Ok(indexes)
+            let pool = pool_manager.get_pg_pool(&config, config.database.as_deref()).await?;
+            let rows: Vec<(String, Vec<String>, bool, bool)> = sqlx::query_as("
+                SELECT i.relname,
+                  ARRAY(SELECT pg_get_indexdef(ix.indexrelid, k.position::int, true)
+                    FROM unnest(ix.indkey) WITH ORDINALITY AS k(attnum, position) ORDER BY k.position),
+                  ix.indisunique, ix.indisprimary
+                FROM pg_index ix JOIN pg_class i ON i.oid=ix.indexrelid
+                JOIN pg_class t ON t.oid=ix.indrelid JOIN pg_namespace n ON n.oid=t.relnamespace
+                WHERE n.nspname='public' AND t.relname=$1 ORDER BY i.relname
+            ").bind(&table).fetch_all(&pool).await.map_err(|e| e.to_string())?;
+            Ok(rows.into_iter().map(|(name, columns, is_unique, is_pk)| IndexDef { name, columns, is_unique, is_pk, comment: None }).collect())
         }
         _ => Ok(Vec::new()),
     }
@@ -1250,7 +841,7 @@ async fn export_database_sql(
     output_path: String,
 ) -> Result<(), String> {
     let target_db = resolve_target_database(&config, database.as_deref())?;
-    let cancel_flag = export_task_manager.start_task(&task_id).await;
+    let cancel_flag = export_task_manager.start_task(&task_id).await?;
     let mut total_tables = 0usize;
     let mut total_units = 1usize;
     let mut processed_units = 0usize;
@@ -1297,12 +888,25 @@ async fn export_database_sql(
     );
 
     let export_result: Result<(), String> = async {
-        let file = fs::File::create(&output_path).map_err(|e| e.to_string())?;
+        let file = storage::AtomicFile::new(&output_path)?;
         let mut writer = BufWriter::new(file);
 
-        match config.db_type.as_str() {
+        let write_result: Result<(), String> = match config.db_type.as_str() {
             "mysql" => {
                 let pool = pool_manager.get_mysql_pool(&config, Some(&target_db)).await?;
+                let mut source = pool.acquire().await.map_err(|e| e.to_string())?;
+                source.close_on_drop();
+                sqlx::Executor::execute(&mut *source, "SET SESSION sql_mode='NO_AUTO_VALUE_ON_ZERO'; SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ; START TRANSACTION WITH CONSISTENT SNAPSHOT;").await.map_err(|e| e.to_string())?;
+                let unsupported: i64 = sqlx::query_scalar("SELECT
+                    (SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA=? AND (TABLE_TYPE<>'BASE TABLE' OR ENGINE<>'InnoDB')) +
+                    (SELECT COUNT(*) FROM information_schema.TRIGGERS WHERE TRIGGER_SCHEMA=?) +
+                    (SELECT COUNT(*) FROM information_schema.ROUTINES WHERE ROUTINE_SCHEMA=?) +
+                    (SELECT COUNT(*) FROM information_schema.EVENTS WHERE EVENT_SCHEMA=?) +
+                    (SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=? AND GENERATION_EXPRESSION<>'')")
+                    .bind(&target_db).bind(&target_db).bind(&target_db).bind(&target_db).bind(&target_db)
+                    .fetch_one(&mut *source).await.map_err(|e| e.to_string())?;
+                if unsupported != 0 { return Err("This database contains non-InnoDB tables, views, generated columns, triggers, routines or events. Use mysqldump for a complete backup; the previous backup was kept.".into()); }
+
                 let tables: Vec<(String, Option<u64>)> = sqlx::query_as(
                     "
                     SELECT TABLE_NAME, TABLE_ROWS
@@ -1312,7 +916,7 @@ async fn export_database_sql(
                     ",
                 )
                 .bind(&target_db)
-                .fetch_all(&pool)
+                .fetch_all(&mut *source)
                 .await
                 .map_err(|e| e.to_string())?;
 
@@ -1333,8 +937,8 @@ async fn export_database_sql(
                 );
 
                 writeln!(writer, "-- RECCH database export").map_err(|e| e.to_string())?;
-                writeln!(writer, "-- Database: {}", target_db).map_err(|e| e.to_string())?;
-                writeln!(writer, "SET FOREIGN_KEY_CHECKS=0;").map_err(|e| e.to_string())?;
+                writeln!(writer, "-- Database: {}", target_db.replace(['\r', '\n'], " ")).map_err(|e| e.to_string())?;
+                writeln!(writer, "SET @RECCH_OLD_SQL_MODE=@@SQL_MODE; SET SQL_MODE='NO_AUTO_VALUE_ON_ZERO'; SET FOREIGN_KEY_CHECKS=0;").map_err(|e| e.to_string())?;
                 writeln!(writer).map_err(|e| e.to_string())?;
 
                 for (table, estimated_rows) in tables {
@@ -1357,13 +961,13 @@ async fn export_database_sql(
                     let quoted_table = quote_mysql_identifier(&table);
                     let show_create_query = format!("SHOW CREATE TABLE {}", quoted_table);
                     let create_row = sqlx::query(&show_create_query)
-                        .fetch_one(&pool)
+                        .fetch_one(&mut *source)
                         .await
                         .map_err(|e| e.to_string())?;
                     let create_stmt: String =
                         create_row.try_get(1).map_err(|e| e.to_string())?;
 
-                    writeln!(writer, "-- Table: {}", table).map_err(|e| e.to_string())?;
+                    writeln!(writer, "-- Table: {}", table.replace(['\r', '\n'], " ")).map_err(|e| e.to_string())?;
                     writeln!(writer, "DROP TABLE IF EXISTS {};", quoted_table)
                         .map_err(|e| e.to_string())?;
                     writeln!(writer, "{};", create_stmt).map_err(|e| e.to_string())?;
@@ -1382,7 +986,7 @@ async fn export_database_sql(
 
                     let count_query = format!("SELECT COUNT(*) FROM {}", quoted_table);
                     let count_row = sqlx::query(&count_query)
-                        .fetch_one(&pool)
+                        .fetch_one(&mut *source)
                         .await
                         .map_err(|e| e.to_string())?;
                     let exact_table_rows = count_row
@@ -1419,7 +1023,7 @@ async fn export_database_sql(
                     )
                     .bind(&target_db)
                     .bind(&table)
-                    .fetch_all(&pool)
+                    .fetch_all(&mut *source)
                     .await
                     .map_err(|e| e.to_string())?;
 
@@ -1430,17 +1034,12 @@ async fn export_database_sql(
                         .join(", ");
                     let mut actual_rows = 0usize;
                     let data_query = format!("SELECT * FROM {}", quoted_table);
-                    let mut rows = sqlx::query(&data_query).fetch(&pool);
+                    let mut rows = sqlx::query(&data_query).fetch(&mut *source);
 
                     while let Some(row) = rows.try_next().await.map_err(|e| e.to_string())? {
                         ensure_not_cancelled(cancel_flag.as_ref())?;
 
-                        let row_map = mysql_row_to_json_map(&row);
-                        let values = columns
-                            .iter()
-                            .map(|column| sql_literal(row_map.get(column), "mysql"))
-                            .collect::<Vec<_>>()
-                            .join(", ");
+                        let values = mysql_export_values(&row, &columns)?;
                         writeln!(
                             writer,
                             "INSERT INTO {} ({}) VALUES ({});",
@@ -1491,12 +1090,25 @@ async fn export_database_sql(
                     );
                 }
 
-                writeln!(writer, "SET FOREIGN_KEY_CHECKS=1;").map_err(|e| e.to_string())?;
+                writeln!(writer, "SET FOREIGN_KEY_CHECKS=1; SET SQL_MODE=@RECCH_OLD_SQL_MODE;").map_err(|e| e.to_string())?;
                 writer.flush().map_err(|e| e.to_string())?;
                 Ok(())
             }
             "postgresql" => {
                 let pool = pool_manager.get_pg_pool(&config, Some(&target_db)).await?;
+                let mut source = pool.acquire().await.map_err(|e| e.to_string())?;
+                source.close_on_drop();
+                sqlx::Executor::execute(&mut *source, "BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY;").await.map_err(|e| e.to_string())?;
+                let unsupported: bool = sqlx::query_scalar("SELECT
+                    EXISTS(SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname NOT IN ('pg_catalog','information_schema') AND n.nspname NOT LIKE 'pg_%' AND ((c.relkind IN ('r','p','v','m') AND (n.nspname<>'public' OR c.relkind<>'r')) OR c.relrowsecurity)) OR
+                    EXISTS(SELECT 1 FROM pg_attribute a JOIN pg_class c ON c.oid=a.attrelid JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='public' AND (a.attidentity<>'' OR a.attgenerated<>'')) OR
+                    EXISTS(SELECT 1 FROM pg_constraint c JOIN pg_namespace n ON n.oid=c.connamespace WHERE n.nspname='public' AND c.contype IN ('c','x')) OR
+                    EXISTS(SELECT 1 FROM pg_trigger t JOIN pg_class c ON c.oid=t.tgrelid JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='public' AND NOT t.tgisinternal) OR
+                    EXISTS(SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname='public')")
+                    .fetch_one(&mut *source).await.map_err(|e| e.to_string())?;
+                if unsupported { return Err("This database contains objects unsupported by the simple public-table exporter. Use pg_dump for a complete backup; the previous backup was kept.".into()); }
+                let mut deferred_constraints = Vec::new();
+
                 let tables: Vec<(String, Option<i64>)> = sqlx::query_as(
                     "
                     SELECT c.relname AS table_name, CAST(c.reltuples AS BIGINT) AS row_count
@@ -1506,7 +1118,7 @@ async fn export_database_sql(
                     ORDER BY c.relname
                     ",
                 )
-                .fetch_all(&pool)
+                .fetch_all(&mut *source)
                 .await
                 .map_err(|e| e.to_string())?;
 
@@ -1529,8 +1141,8 @@ async fn export_database_sql(
                 let public_schema = quote_pg_identifier("public");
 
                 writeln!(writer, "-- RECCH database export").map_err(|e| e.to_string())?;
-                writeln!(writer, "-- Database: {}", target_db).map_err(|e| e.to_string())?;
-                writeln!(writer, "BEGIN;").map_err(|e| e.to_string())?;
+                writeln!(writer, "-- Database: {}", target_db.replace(['\r', '\n'], " ")).map_err(|e| e.to_string())?;
+                writeln!(writer, "BEGIN; SET LOCAL standard_conforming_strings=on;").map_err(|e| e.to_string())?;
                 writeln!(writer).map_err(|e| e.to_string())?;
 
                 for (table, estimated_rows) in tables {
@@ -1574,7 +1186,7 @@ async fn export_database_sql(
                             ",
                         )
                         .bind(&table)
-                        .fetch_all(&pool)
+                        .fetch_all(&mut *source)
                         .await
                         .map_err(|e| e.to_string())?;
 
@@ -1592,7 +1204,7 @@ async fn export_database_sql(
                         ",
                     )
                     .bind(&table)
-                    .fetch_all(&pool)
+                    .fetch_all(&mut *source)
                     .await
                     .map_err(|e| e.to_string())?;
 
@@ -1605,7 +1217,7 @@ async fn export_database_sql(
                         ",
                     )
                     .bind(&table)
-                    .fetch_one(&pool)
+                    .fetch_one(&mut *source)
                     .await
                     .map_err(|e| e.to_string())?;
 
@@ -1620,7 +1232,7 @@ async fn export_database_sql(
                         ",
                     )
                     .bind(&table)
-                    .fetch_all(&pool)
+                    .fetch_all(&mut *source)
                     .await
                     .map_err(|e| e.to_string())?;
 
@@ -1634,7 +1246,7 @@ async fn export_database_sql(
                         ",
                     )
                     .bind(&table)
-                    .fetch_all(&pool)
+                    .fetch_all(&mut *source)
                     .await
                     .map_err(|e| e.to_string())?;
 
@@ -1671,7 +1283,7 @@ async fn export_database_sql(
                         create_lines.push(format!("PRIMARY KEY ({})", pk_sql));
                     }
 
-                    writeln!(writer, "-- Table: {}", table).map_err(|e| e.to_string())?;
+                    writeln!(writer, "-- Table: {}", table.replace(['\r', '\n'], " ")).map_err(|e| e.to_string())?;
                     writeln!(writer, "DROP TABLE IF EXISTS {} CASCADE;", full_table_name)
                         .map_err(|e| e.to_string())?;
                     writeln!(
@@ -1723,7 +1335,7 @@ async fn export_database_sql(
 
                     let count_query = format!("SELECT COUNT(*) FROM {}", full_table_name);
                     let exact_table_rows: i64 = sqlx::query_scalar(&count_query)
-                        .fetch_one(&pool)
+                        .fetch_one(&mut *source)
                         .await
                         .map_err(|e| e.to_string())?;
 
@@ -1753,17 +1365,12 @@ async fn export_database_sql(
                         .join(", ");
                     let mut actual_rows = 0usize;
                     let data_query = format!("SELECT * FROM {}", full_table_name);
-                    let mut rows = sqlx::query(&data_query).fetch(&pool);
+                    let mut rows = sqlx::query(&data_query).fetch(&mut *source);
 
                     while let Some(row) = rows.try_next().await.map_err(|e| e.to_string())? {
                         ensure_not_cancelled(cancel_flag.as_ref())?;
 
-                        let row_map = pg_row_to_json_map(&row);
-                        let values = ordered_columns
-                            .iter()
-                            .map(|column| sql_literal(row_map.get(column), "postgresql"))
-                            .collect::<Vec<_>>()
-                            .join(", ");
+                        let values = pg_export_values(&row, &ordered_columns)?;
                         writeln!(
                             writer,
                             "INSERT INTO {} ({}) VALUES ({});",
@@ -1819,14 +1426,7 @@ async fn export_database_sql(
                     }
 
                     for (constraint_name, constraint_def) in foreign_keys {
-                        writeln!(
-                            writer,
-                            "ALTER TABLE ONLY {} ADD CONSTRAINT {} {};",
-                            full_table_name,
-                            quote_pg_identifier(&constraint_name),
-                            constraint_def
-                        )
-                        .map_err(|e| e.to_string())?;
+                        deferred_constraints.push(format!("ALTER TABLE ONLY {} ADD CONSTRAINT {} {};", full_table_name, quote_pg_identifier(&constraint_name), constraint_def));
                     }
 
                     writeln!(writer).map_err(|e| e.to_string())?;
@@ -1845,12 +1445,16 @@ async fn export_database_sql(
                     );
                 }
 
+                for constraint in deferred_constraints { writeln!(writer, "{}", constraint).map_err(|e| e.to_string())?; }
                 writeln!(writer, "COMMIT;").map_err(|e| e.to_string())?;
                 writer.flush().map_err(|e| e.to_string())?;
                 Ok(())
             }
             _ => Err("Database export is only supported for MySQL and PostgreSQL".to_string()),
-        }
+        };
+        write_result?;
+        ensure_not_cancelled(cancel_flag.as_ref())?;
+        writer.into_inner().map_err(|e| e.error().to_string())?.commit()
     }
     .await;
 
@@ -1862,9 +1466,6 @@ async fn export_database_sql(
         Err(_) => "error",
     };
 
-    if export_result.is_err() {
-        let _ = fs::remove_file(&output_path);
-    }
 
     emit_export_progress(
         &app_handle,
@@ -1913,12 +1514,16 @@ async fn import_database_sql(
     match config.db_type.as_str() {
         "mysql" => {
             let pool = pool_manager.get_mysql_pool(&config, Some(&target_db)).await?;
-            let result = raw_sql(&script).execute(&pool).await.map_err(|e| e.to_string())?;
+            let mut connection = pool.acquire().await.map_err(|e| e.to_string())?;
+            connection.close_on_drop();
+            let result = sqlx::Executor::execute(&mut *connection, script.as_str()).await.map_err(|e| e.to_string())?;
             Ok(result.rows_affected())
         }
         "postgresql" => {
             let pool = pool_manager.get_pg_pool(&config, Some(&target_db)).await?;
-            let result = raw_sql(&script).execute(&pool).await.map_err(|e| e.to_string())?;
+            let mut connection = pool.acquire().await.map_err(|e| e.to_string())?;
+            connection.close_on_drop();
+            let result = sqlx::Executor::execute(&mut *connection, script.as_str()).await.map_err(|e| e.to_string())?;
             Ok(result.rows_affected())
         }
         _ => Err("Database import is only supported for MySQL and PostgreSQL".to_string()),
@@ -1928,210 +1533,12 @@ async fn import_database_sql(
 // ... existing code ...
 
 #[tauri::command]
-async fn alter_table(
-    pool_manager: tauri::State<'_, PoolManager>,
-    config: ConnectionConfig,
-    table: String,
-    operation: AlterOperation,
-) -> Result<(), String> {
-    let query = match config.db_type.as_str() {
-        "mysql" => {
-            match operation.op_type.as_str() {
-                "add" => {
-                    let col = operation
-                        .column_def
-                        .as_ref()
-                        .ok_or("Missing column definition")?;
-                    let comment = col
-                        .comment
-                        .as_ref()
-                        .map(|c| format!("COMMENT '{}'", c.replace("'", "''")))
-                        .unwrap_or_default();
-                    let null_def = if col.is_nullable == Some(false) {
-                        "NOT NULL"
-                    } else {
-                        "NULL"
-                    };
-                    let default_def = col
-                        .default_value
-                        .as_ref()
-                        .map(|d| format!("DEFAULT {}", d))
-                        .unwrap_or_default();
-                    let pk_def = if col.is_pk { "PRIMARY KEY" } else { "" };
-
-                    format!(
-                        "ALTER TABLE {} ADD COLUMN {} {} {} {} {} {}",
-                        table, col.name, col.type_name, null_def, default_def, pk_def, comment
-                    )
-                }
-                "modify" => {
-                    let col = operation
-                        .column_def
-                        .as_ref()
-                        .ok_or("Missing column definition")?;
-                    let comment = col
-                        .comment
-                        .as_ref()
-                        .map(|c| format!("COMMENT '{}'", c.replace("'", "''")))
-                        .unwrap_or_default();
-                    let null_def = if col.is_nullable == Some(false) {
-                        "NOT NULL"
-                    } else {
-                        "NULL"
-                    };
-                    let default_def = col
-                        .default_value
-                        .as_ref()
-                        .map(|d| format!("DEFAULT {}", d))
-                        .unwrap_or_default();
-
-                    format!(
-                        "ALTER TABLE {} MODIFY COLUMN {} {} {} {} {}",
-                        table, col.name, col.type_name, null_def, default_def, comment
-                    )
-                }
-                "drop" => {
-                    let col_name = operation
-                        .column_name
-                        .as_ref()
-                        .ok_or("Missing column name")?;
-                    format!("ALTER TABLE {} DROP COLUMN {}", table, col_name)
-                }
-                "rename" => {
-                    // MySQL RENAME COLUMN old TO new
-                    let col_name = operation
-                        .column_name
-                        .as_ref()
-                        .ok_or("Missing column name")?;
-                    let new_name = operation.new_name.as_ref().ok_or("Missing new name")?;
-                    format!(
-                        "ALTER TABLE {} RENAME COLUMN {} TO {}",
-                        table, col_name, new_name
-                    )
-                }
-                "add_index" => {
-                    let idx = operation
-                        .index_def
-                        .as_ref()
-                        .ok_or("Missing index definition")?;
-                    let cols = idx.columns.join(", ");
-                    let unique = if idx.is_unique { "UNIQUE" } else { "" };
-                    format!(
-                        "CREATE {} INDEX {} ON {} ({})",
-                        unique, idx.name, table, cols
-                    )
-                }
-                "drop_index" => {
-                    let idx_name = operation.index_name.as_ref().ok_or("Missing index name")?;
-                    format!("DROP INDEX {} ON {}", idx_name, table)
-                }
-                _ => return Err("Unknown operation".to_string()),
-            }
-        }
-        "postgresql" => {
-            match operation.op_type.as_str() {
-                "add" => {
-                    let col = operation
-                        .column_def
-                        .as_ref()
-                        .ok_or("Missing column definition")?;
-                    // PG doesn't support comment in ADD COLUMN syntax directly usually, need separate COMMENT ON
-                    // But for simplicity here, we might just add column first. Detailed comment support needs multiple queries or a transaction.
-                    // For now: ALTER TABLE ... ADD COLUMN ...
-                    format!(
-                        "ALTER TABLE {} ADD COLUMN {} {}",
-                        table, col.name, col.type_name
-                    )
-                }
-                "modify" => {
-                    let col = operation
-                        .column_def
-                        .as_ref()
-                        .ok_or("Missing column definition")?;
-                    // PG: ALTER TABLE ... ALTER COLUMN ... TYPE ...
-                    format!(
-                        "ALTER TABLE {} ALTER COLUMN {} TYPE {}",
-                        table, col.name, col.type_name
-                    )
-                }
-                "drop" => {
-                    let col_name = operation
-                        .column_name
-                        .as_ref()
-                        .ok_or("Missing column name")?;
-                    format!("ALTER TABLE {} DROP COLUMN {}", table, col_name)
-                }
-                "rename" => {
-                    let col_name = operation
-                        .column_name
-                        .as_ref()
-                        .ok_or("Missing column name")?;
-                    let new_name = operation.new_name.as_ref().ok_or("Missing new name")?;
-                    format!(
-                        "ALTER TABLE {} RENAME COLUMN {} TO {}",
-                        table, col_name, new_name
-                    )
-                }
-                "add_index" => {
-                    let idx = operation
-                        .index_def
-                        .as_ref()
-                        .ok_or("Missing index definition")?;
-                    let cols = idx.columns.join(", ");
-                    let unique = if idx.is_unique { "UNIQUE" } else { "" };
-                    format!(
-                        "CREATE {} INDEX {} ON {} ({})",
-                        unique, idx.name, table, cols
-                    )
-                }
-                "drop_index" => {
-                    let idx_name = operation.index_name.as_ref().ok_or("Missing index name")?;
-                    format!("DROP INDEX {}", idx_name)
-                }
-                _ => return Err("Unknown operation".to_string()),
-            }
-        }
-        _ => return Err("Unsupported database".to_string()),
-    };
-
-    match config.db_type.as_str() {
-        "mysql" => {
-            let pool = pool_manager
-                .get_mysql_pool(&config, config.database.as_deref())
-                .await?;
-            sqlx::query(&query)
-                .execute(&pool)
-                .await
-                .map_err(|e| e.to_string())?;
-        }
-        "postgresql" => {
-            let pool = pool_manager
-                .get_pg_pool(&config, config.database.as_deref())
-                .await?;
-            sqlx::query(&query)
-                .execute(&pool)
-                .await
-                .map_err(|e| e.to_string())?;
-
-            // Handle comment for PG separately if it's ADD
-            if operation.op_type == "add" && config.db_type == "postgresql" {
-                if let Some(col) = operation.column_def.as_ref() {
-                    if let Some(comment) = &col.comment {
-                        let comment_query = format!(
-                            "COMMENT ON COLUMN {}.{} IS '{}'",
-                            table,
-                            col.name,
-                            comment.replace("'", "''")
-                        );
-                        let _ = sqlx::query(&comment_query).execute(&pool).await;
-                    }
-                }
-            }
-        }
-        _ => {}
-    }
-
-    Ok(())
+async fn alter_table(pool_manager: tauri::State<'_, PoolManager>, config: ConnectionConfig, table: String, operation: AlterOperation) -> Result<(), String> {
+    schema_edits::alter(pool_manager.inner(), &config, &table, &operation).await
+}
+#[tauri::command]
+async fn import_table_rows(pool_manager: tauri::State<'_, PoolManager>, config: ConnectionConfig, table: String, rows: Vec<HashMap<String, Value>>) -> Result<u64, String> {
+    table_import::import_rows(pool_manager.inner(), &config, &table, &rows).await
 }
 
 #[tauri::command]
@@ -2147,27 +1554,15 @@ async fn execute_query(
 
 #[tauri::command]
 async fn get_ai_config(app: tauri::AppHandle) -> Result<ai_service::AIConfig, String> {
-    let config_dir = app.path().app_config_dir().map_err(|e| e.to_string())?;
-    let config_path = config_dir.join("ai_config.json");
-
-    if config_path.exists() {
-        let content = fs::read_to_string(&config_path).map_err(|e| e.to_string())?;
-        let config: ai_service::AIConfig = serde_json::from_str(&content).unwrap_or_default();
-        Ok(config)
-    } else {
-        Ok(ai_service::AIConfig::default())
-    }
+    let dir = app.path().app_config_dir().map_err(|e| e.to_string())?;
+    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    storage::read_json(&dir.join("ai_config.json"))
 }
-
 #[tauri::command]
 async fn save_ai_config(app: tauri::AppHandle, config: ai_service::AIConfig) -> Result<(), String> {
-    let config_dir = app.path().app_config_dir().map_err(|e| e.to_string())?;
-    fs::create_dir_all(&config_dir).map_err(|e| e.to_string())?;
-    let config_path = config_dir.join("ai_config.json");
-
-    let content = serde_json::to_string_pretty(&config).map_err(|e| e.to_string())?;
-    fs::write(&config_path, content).map_err(|e| e.to_string())?;
-    Ok(())
+    let dir = app.path().app_config_dir().map_err(|e| e.to_string())?;
+    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    storage::write_json(&dir.join("ai_config.json"), config)
 }
 
 #[tauri::command]
@@ -2208,23 +1603,8 @@ async fn get_redis_key_value(
     key: String,
     database: Option<String>,
 ) -> Result<RedisKeyInfo, String> {
-    let mut con = pool_manager.get_redis_conn(&config).await?;
-
-    // Select DB
-    let db_str = database.or(config.database).unwrap_or_default();
-    let db_part = db_str.split_whitespace().next().unwrap_or("");
-    let db_index: i32 = if db_part.is_empty() {
-        0
-    } else if let Some(num_str) = db_part.strip_prefix("db") {
-        num_str.parse().unwrap_or(0)
-    } else {
-        db_part.parse().unwrap_or(0)
-    };
-    let _: () = redis::cmd("SELECT")
-        .arg(db_index)
-        .query_async(&mut con)
-        .await
-        .map_err(|e| e.to_string())?;
+    let selected = redis_support::selected_config(&config, database.as_deref())?;
+    let mut con = pool_manager.get_redis_conn(&selected).await?;
 
     // Get key type
     let key_type: String = redis::cmd("TYPE")
@@ -2238,8 +1618,14 @@ async fn get_redis_key_value(
         .arg(&key)
         .query_async(&mut con)
         .await
-        .unwrap_or(-1);
+        .map_err(|e| e.to_string())?;
 
+    // Fail explicitly on oversized previews rather than freezing the desktop.
+    let size_command = match key_type.as_str() { "string" => Some(("STRLEN", 1_048_576)), "hash" => Some(("HLEN", 1000)), "set" => Some(("SCARD", 1000)), _ => None };
+    if let Some((command, limit)) = size_command {
+        let size: i64 = redis::cmd(command).arg(&key).query_async(&mut con).await.map_err(|e| e.to_string())?;
+        if size > limit { return Err("Value is too large for a complete preview; use bounded Redis commands in the console".into()); }
+    }
     // Get value based on type
     let (value, length) = match key_type.as_str() {
         "string" => {
@@ -2247,7 +1633,7 @@ async fn get_redis_key_value(
                 .arg(&key)
                 .query_async(&mut con)
                 .await
-                .unwrap_or_default();
+                .map_err(|e| e.to_string())?;
             (v, None)
         }
         "list" => {
@@ -2255,16 +1641,16 @@ async fn get_redis_key_value(
                 .arg(&key)
                 .query_async(&mut con)
                 .await
-                .unwrap_or(0);
+                .map_err(|e| e.to_string())?;
             let items: Vec<String> = redis::cmd("LRANGE")
                 .arg(&key)
                 .arg(0)
                 .arg(99)
                 .query_async(&mut con)
                 .await
-                .unwrap_or_default();
+                .map_err(|e| e.to_string())?;
             (
-                serde_json::to_string_pretty(&items).unwrap_or_default(),
+                serde_json::to_string_pretty(&items).map_err(|e| e.to_string())?,
                 Some(len),
             )
         }
@@ -2273,14 +1659,14 @@ async fn get_redis_key_value(
                 .arg(&key)
                 .query_async(&mut con)
                 .await
-                .unwrap_or(0);
+                .map_err(|e| e.to_string())?;
             let items: Vec<String> = redis::cmd("SMEMBERS")
                 .arg(&key)
                 .query_async(&mut con)
                 .await
-                .unwrap_or_default();
+                .map_err(|e| e.to_string())?;
             (
-                serde_json::to_string_pretty(&items).unwrap_or_default(),
+                serde_json::to_string_pretty(&items).map_err(|e| e.to_string())?,
                 Some(len),
             )
         }
@@ -2289,7 +1675,7 @@ async fn get_redis_key_value(
                 .arg(&key)
                 .query_async(&mut con)
                 .await
-                .unwrap_or(0);
+                .map_err(|e| e.to_string())?;
             let items: Vec<String> = redis::cmd("ZRANGE")
                 .arg(&key)
                 .arg(0)
@@ -2297,9 +1683,9 @@ async fn get_redis_key_value(
                 .arg("WITHSCORES")
                 .query_async(&mut con)
                 .await
-                .unwrap_or_default();
+                .map_err(|e| e.to_string())?;
             (
-                serde_json::to_string_pretty(&items).unwrap_or_default(),
+                serde_json::to_string_pretty(&items).map_err(|e| e.to_string())?,
                 Some(len),
             )
         }
@@ -2308,12 +1694,12 @@ async fn get_redis_key_value(
                 .arg(&key)
                 .query_async(&mut con)
                 .await
-                .unwrap_or(0);
+                .map_err(|e| e.to_string())?;
             let items: Vec<String> = redis::cmd("HGETALL")
                 .arg(&key)
                 .query_async(&mut con)
                 .await
-                .unwrap_or_default();
+                .map_err(|e| e.to_string())?;
             // Convert flat list to key-value pairs
             let mut map = std::collections::HashMap::new();
             let mut iter = items.iter();
@@ -2321,7 +1707,7 @@ async fn get_redis_key_value(
                 map.insert(k.clone(), v.clone());
             }
             (
-                serde_json::to_string_pretty(&map).unwrap_or_default(),
+                serde_json::to_string_pretty(&map).map_err(|e| e.to_string())?,
                 Some(len),
             )
         }
@@ -2357,6 +1743,7 @@ pub fn run() {
             export_database_sql,
             cancel_database_export,
             import_database_sql,
+            import_table_rows,
             alter_table,
             get_indexes,
             get_ai_config,

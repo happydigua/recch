@@ -25,6 +25,7 @@ pub fn mysql_row_to_json_map(row: &MySqlRow) -> Result<Record, String> {
     let mut map = HashMap::new();
     for col in row.columns() {
         let i = col.ordinal(); let name = col.name(); let kind = col.type_info().name();
+        if map.contains_key(name) { return Err(format!("Duplicate result column {name:?}; use distinct SQL aliases")); }
         if row.try_get_raw(i).map_err(|e| e.to_string())?.is_null() { map.insert(name.into(), Value::Null); continue; }
         let decoded: Result<Value, sqlx::Error> = match kind {
             "BOOLEAN" | "BOOL" => row.try_get::<bool, _>(i).map(|v| json!(v)),
@@ -53,6 +54,7 @@ pub fn pg_row_to_json_map(row: &PgRow) -> Result<Record, String> {
     let mut map = HashMap::new();
     for col in row.columns() {
         let i = col.ordinal(); let name = col.name(); let kind = col.type_info().name();
+        if map.contains_key(name) { return Err(format!("Duplicate result column {name:?}; use distinct SQL aliases")); }
         if row.try_get_raw(i).map_err(|e| e.to_string())?.is_null() { map.insert(name.into(), Value::Null); continue; }
         let decoded: Result<Value, sqlx::Error> = match kind {
             "BOOL" => row.try_get::<bool, _>(i).map(|v| json!(v)),

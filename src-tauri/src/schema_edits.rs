@@ -21,6 +21,11 @@ fn column_type(value: &str) -> Result<String, String> {
     Ok(normalized)
 }
 
+fn ddl_string(value: &str, dialect: &str) -> String {
+    if dialect == "mysql" { format!("'{}'", crate::escape_sql_string(value, dialect)) }
+    else { sql_literal(Some(&Value::String(value.to_string())), dialect) }
+}
+
 fn default_sql(value: Option<&str>, dialect: &str) -> Result<Option<String>, String> {
     let Some(value) = value.map(str::trim).filter(|s| !s.is_empty()) else { return Ok(None); };
     let upper = value.to_uppercase();
@@ -35,7 +40,7 @@ fn default_sql(value: Option<&str>, dialect: &str) -> Result<Option<String>, Str
             if c == '\'' && chars.next() != Some('\'') { return Err("Invalid quoted default value".into()); }
             decoded.push(c);
         }
-        return Ok(Some(sql_literal(Some(&Value::String(decoded)), dialect)));
+        return Ok(Some(ddl_string(&decoded, dialect)));
     }
     Err("Unsupported default expression; use the SQL console rather than losing the existing definition".into())
 }
@@ -58,14 +63,14 @@ pub fn queries(table: &str, operation: &AlterOperation, dialect: &str) -> Result
             let col = operation.column_def.as_ref().ok_or("Missing column definition")?;
             if col.name.is_empty() || col.name.contains('\0') { return Err("Invalid column name".into()); }
             let old = operation.column_name.as_deref().unwrap_or(&col.name);
-            let comment = col.comment.as_ref().map(|s| sql_literal(Some(&Value::String(s.clone())), dialect)).unwrap_or("NULL".into());
+            let comment = col.comment.as_ref().map(|s| ddl_string(s, dialect)).unwrap_or("NULL".into());
             if operation.op_type == "add" {
                 let pk = if col.is_pk { " PRIMARY KEY" } else { "" };
-                let suffix = if dialect == "mysql" { format!(" COMMENT {}", col.comment.as_ref().map(|s| sql_literal(Some(&Value::String(s.clone())), dialect)).unwrap_or("''".into())) } else { String::new() };
+                let suffix = if dialect == "mysql" { format!(" COMMENT {}", col.comment.as_ref().map(|s| ddl_string(s, dialect)).unwrap_or("''".into())) } else { String::new() };
                 result.push(format!("ALTER TABLE {table} ADD COLUMN {}{pk}{suffix}", definition(col, dialect)?));
             } else if dialect == "mysql" {
                 result.push(format!("ALTER TABLE {table} CHANGE COLUMN {} {} COMMENT {}", quote(old), definition(col, dialect)?,
-                    col.comment.as_ref().map(|s| sql_literal(Some(&Value::String(s.clone())), dialect)).unwrap_or("''".into())));
+                    col.comment.as_ref().map(|s| ddl_string(s, dialect)).unwrap_or("''".into())));
             } else {
                 result.push(format!("ALTER TABLE {table} ALTER COLUMN {} TYPE {}", quote(old), column_type(&col.type_name)?));
                 result.push(format!("ALTER TABLE {table} ALTER COLUMN {} {} NOT NULL", quote(old), if col.is_nullable == Some(false) { "SET" } else { "DROP" }));
@@ -113,7 +118,12 @@ pub async fn alter(manager: &PoolManager, config: &ConnectionConfig, table: &str
                     }
                 }
             }
-            for statement in statements { sqlx::query(&statement).execute(&pool).await.map_err(|e| e.to_string())?; }
+            let mut connection = pool.acquire().await.map_err(|e| e.to_string())?;
+            connection.close_on_drop();
+            let modes: String = sqlx::query_scalar("SELECT @@SESSION.sql_mode").fetch_one(&mut *connection).await.map_err(|e| e.to_string())?;
+            let modes = modes.split(',').filter(|mode| *mode != "NO_BACKSLASH_ESCAPES").collect::<Vec<_>>().join(",");
+            sqlx::query("SET SESSION sql_mode = ?").bind(modes).execute(&mut *connection).await.map_err(|e| e.to_string())?;
+            for statement in statements { sqlx::query(&statement).execute(&mut *connection).await.map_err(|e| e.to_string())?; }
         }
         "postgresql" => {
             let pool = manager.get_pg_pool(config, None).await?;
@@ -153,5 +163,49 @@ mod tests {
         assert!(default_sql(Some("0, DROP COLUMN secret"), "mysql").is_err());
         assert!(default_sql(Some("nextval('a')"), "postgresql").is_err());
         assert!(column_type("decimal(30,9)").is_ok());
+    }
+}
+
+#[cfg(test)]
+mod integration_tests {
+    use super::*;
+    #[tokio::test]
+    #[ignore = "requires disposable CI database services"]
+    async fn integration_visual_ddl_preserves_names_defaults_and_nullability() {
+        let name = format!("recch_ddl_{}", uuid::Uuid::new_v4().simple());
+        let manager = PoolManager::new();
+        let mut config = ConnectionConfig { id: "ddl-fixture".into(), name: "Fixture".into(), db_type: "mysql".into(),
+            host: "127.0.0.1".into(), port: 3306, username: Some("root".into()), password: Some("recch_ci_only".into()), database: Some("recch_test".into()) };
+        let operation = AlterOperation { op_type: "add".into(), column_name: None, new_name: None,
+            column_def: Some(ColumnDef { name: "old name".into(), type_name: "VARCHAR(40)".into(), is_pk: false,
+                is_nullable: Some(false), default_value: Some("'it''s'".into()), comment: Some("owner's note".into()) }), index_def: None, index_name: None };
+        let mysql = manager.get_mysql_pool(&config, None).await.unwrap();
+        sqlx::query(&format!("CREATE TABLE `{name}` (id INT PRIMARY KEY AUTO_INCREMENT) ENGINE=InnoDB")).execute(&mysql).await.unwrap();
+        alter(&manager, &config, &name, &operation).await.unwrap();
+        let mut modify = operation;
+        modify.op_type = "modify".into(); modify.column_name = Some("old name".into());
+        modify.column_def.as_mut().unwrap().name = "new name".into();
+        alter(&manager, &config, &name, &modify).await.unwrap();
+        sqlx::query(&format!("INSERT INTO `{name}` (id) VALUES (1)")).execute(&mysql).await.unwrap();
+        let text: String = sqlx::query_scalar(&format!("SELECT `new name` FROM `{name}` WHERE id=1")).fetch_one(&mysql).await.unwrap();
+        assert_eq!(text, "it's");
+        assert!(sqlx::query(&format!("INSERT INTO `{name}` (id, `new name`) VALUES (2,NULL)")).execute(&mysql).await.is_err());
+        sqlx::query(&format!("DROP TABLE `{name}`")).execute(&mysql).await.unwrap();
+        config.db_type = "postgresql".into(); config.port = 5432; config.username = Some("postgres".into());
+        let pg = manager.get_pg_pool(&config, None).await.unwrap();
+        sqlx::query(&format!("CREATE TABLE \"{name}\" (id INT PRIMARY KEY, \"old name\" VARCHAR(40))")).execute(&pg).await.unwrap();
+        alter(&manager, &config, &name, &modify).await.unwrap();
+        sqlx::query(&format!("INSERT INTO \"{name}\" (id) VALUES (1)")).execute(&pg).await.unwrap();
+        let text: String = sqlx::query_scalar(&format!("SELECT \"new name\" FROM \"{name}\" WHERE id=1")).fetch_one(&pg).await.unwrap(); assert_eq!(text, "it's");
+        assert!(sqlx::query(&format!("INSERT INTO \"{name}\" (id, \"new name\") VALUES (2,NULL)")).execute(&pg).await.is_err());
+        let comment: Option<String> = sqlx::query_scalar("SELECT col_description(c.oid,a.attnum) FROM pg_class c JOIN pg_attribute a ON a.attrelid=c.oid WHERE c.relname=$1 AND a.attname='new name'")
+            .bind(&name).fetch_one(&pg).await.unwrap(); assert_eq!(comment.as_deref(), Some("owner's note"));
+        // Failure in the final rename must also roll back earlier type/default changes.
+        let mut failed = modify; failed.column_name = Some("new name".into());
+        let definition = failed.column_def.as_mut().unwrap(); definition.name = "id".into(); definition.default_value = Some("'changed'".into());
+        assert!(alter(&manager, &config, &name, &failed).await.is_err());
+        sqlx::query(&format!("INSERT INTO \"{name}\" (id) VALUES (3)")).execute(&pg).await.unwrap();
+        let text: String = sqlx::query_scalar(&format!("SELECT \"new name\" FROM \"{name}\" WHERE id=3")).fetch_one(&pg).await.unwrap(); assert_eq!(text, "it's");
+        sqlx::query(&format!("DROP TABLE \"{name}\"")).execute(&pg).await.unwrap();
     }
 }

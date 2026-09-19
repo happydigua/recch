@@ -181,7 +181,7 @@ mod tests {
     #[test]
     fn saved_credentials_have_owner_only_permissions() {
         let dir = TestDir::new(); let target = dir.file();
-        write_json(&target, vec!["secret"]).unwrap();
+        write_json(&target, vec!["secret".to_string()]).unwrap();
         assert_eq!(fs::metadata(&target).unwrap().permissions().mode() & 0o777, 0o600);
     }
 }

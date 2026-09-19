@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, watch } from 'vue'
+import { ref, watch, onBeforeUnmount } from 'vue'
 import { 
   NCard, NSpace, NTag, NCode, NSpin, NEmpty, NDescriptions, NDescriptionsItem,
   NIcon, NButton
@@ -26,28 +26,21 @@ const loading = ref(false)
 const keyInfo = ref<RedisKeyInfo | null>(null)
 const error = ref('')
 
+let requestId = 0
 async function loadKeyInfo() {
-  if (!props.selectedKey) return
-  
+  const request = ++requestId
+  keyInfo.value = null; error.value = ''
+  if (!props.selectedKey) { loading.value = false; return }
+  const config = { ...props.config }, key = props.selectedKey, database = props.database
   loading.value = true
-  error.value = ''
   try {
-    const info = await invoke<RedisKeyInfo>('get_redis_key_value', {
-      config: props.config,
-      key: props.selectedKey,
-      database: props.database
-    })
-    keyInfo.value = info
-  } catch (e: any) {
-    error.value = e.toString()
-  } finally {
-    loading.value = false
-  }
+    const info = await invoke<RedisKeyInfo>('get_redis_key_value', { config, key, database })
+    if (request === requestId) keyInfo.value = info
+  } catch (e) { if (request === requestId) error.value = String(e) }
+  finally { if (request === requestId) loading.value = false }
 }
-
-watch(() => props.selectedKey, () => {
-  loadKeyInfo()
-}, { immediate: true })
+watch(() => [props.selectedKey, props.database, JSON.stringify(props.config)], loadKeyInfo, { immediate: true })
+onBeforeUnmount(() => { requestId++ })
 
 function getTypeColor(type: string): 'default' | 'info' | 'warning' | 'error' | 'success' | 'primary' {
   const colors: Record<string, 'default' | 'info' | 'warning' | 'error' | 'success' | 'primary'> = {

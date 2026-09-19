@@ -30,7 +30,7 @@ pub async fn import_rows(manager: &PoolManager, config: &ConnectionConfig, table
     match config.db_type.as_str() {
         "mysql" => {
             let pool = manager.get_mysql_pool(config, config.database.as_deref()).await?;
-            let engine: Option<String> = sqlx::query_scalar("SELECT ENGINE FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?")
+            let engine: Option<String> = sqlx::query_scalar::<_, Option<String>>("SELECT ENGINE FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?")
                 .bind(table).fetch_optional(&pool).await.map_err(|e| e.to_string())?.flatten();
             if !engine.as_deref().map(|e| e.eq_ignore_ascii_case("InnoDB")).unwrap_or(false) {
                 return Err("Atomic MySQL row import requires an InnoDB base table".into());

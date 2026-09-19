@@ -21,7 +21,6 @@ struct PoolKey {
 pub enum PoolEntry {
     MySql(MySqlPool),
     Postgres(PgPool),
-    Redis(redis::aio::MultiplexedConnection),
 }
 
 /// Manages connection pools for all active database connections
@@ -101,11 +100,10 @@ impl PoolManager {
         // unescaped usernames/database names (or an unbracketed IPv6 address).
         let pool = MySqlPoolOptions::new()
             .max_connections(5)
-            .min_connections(1)
+            .min_connections(0)
+            .acquire_timeout(std::time::Duration::from_secs(15))
             .idle_timeout(std::time::Duration::from_secs(300))
-            .connect_with(Self::mysql_options(config, database))
-            .await
-            .map_err(|e| e.to_string())?;
+            .connect_lazy_with(Self::mysql_options(config, database));
 
         pools.insert(key, PoolEntry::MySql(pool.clone()));
         Ok(pool)
@@ -133,58 +131,18 @@ impl PoolManager {
 
         let pool = PgPoolOptions::new()
             .max_connections(5)
-            .min_connections(1)
+            .min_connections(0)
+            .acquire_timeout(std::time::Duration::from_secs(15))
             .idle_timeout(std::time::Duration::from_secs(300))
-            .connect_with(Self::pg_options(config, database))
-            .await
-            .map_err(|e| e.to_string())?;
+            .connect_lazy_with(Self::pg_options(config, database));
 
         pools.insert(key, PoolEntry::Postgres(pool.clone()));
         Ok(pool)
     }
 
-    /// Get or create a Redis multiplexed connection
-    pub async fn get_redis_conn(
-        &self,
-        config: &ConnectionConfig,
-    ) -> Result<redis::aio::MultiplexedConnection, String> {
-        let key = Self::pool_key(config, None);
-
-        {
-            let pools = self.pools.read().await;
-            if let Some(PoolEntry::Redis(conn)) = pools.get(&key) {
-                return Ok(conn.clone());
-            }
-        }
-
-        let mut pools = self.pools.write().await;
-        if let Some(PoolEntry::Redis(conn)) = pools.get(&key) {
-            return Ok(conn.clone());
-        }
-
-        let url = if let Some(pass) = &config.password {
-            if !pass.is_empty() {
-                format!(
-                    "redis://:{}@{}:{}/",
-                    urlencoding::encode(pass),
-                    config.host,
-                    config.port
-                )
-            } else {
-                format!("redis://{}:{}/", config.host, config.port)
-            }
-        } else {
-            format!("redis://{}:{}/", config.host, config.port)
-        };
-
-        let client = redis::Client::open(url).map_err(|e| e.to_string())?;
-        let conn = client
-            .get_multiplexed_async_connection()
-            .await
-            .map_err(|e| e.to_string())?;
-
-        pools.insert(key, PoolEntry::Redis(conn.clone()));
-        Ok(conn)
+    /// Redis stateful commands require a new physical connection per operation.
+    pub async fn get_redis_conn(&self, config: &ConnectionConfig) -> Result<redis::aio::MultiplexedConnection, String> {
+        crate::redis_support::connect(config).await
     }
 
     /// Remove this saved connection's pools, including previous configurations.
