@@ -12,6 +12,15 @@ s = p.read_text()
 old = 'v.get(1).and_then(|s| s.parse().ok())'
 assert s.count(old) == 1
 s = s.replace(old, 'v.get(1).and_then(|s| s.parse::<usize>().ok())')
+# Executor::execute returns a boxed Send future with explicit lifetimes. Avoid
+# RawSql::execute's generic async wrapper at Tauri's Send command boundary.
+pattern = r'raw_sql\(("[^"\n]*"|&script)\)\s*\.execute\((&mut \*(?:source|connection))\)'
+def executor(match):
+    query = 'script.as_str()' if match[1] == '&script' else match[1]
+    return 'sqlx::Executor::execute(' + match[2] + ', ' + query + ')'
+s, count = re.subn(pattern, executor, s)
+assert count == 4, ('SQL batch executors', count)
+s = s.replace('use sqlx::raw_sql;\n', '')
 p.write_text(s)
 p = Path('src/components/DataGrid.vue')
 s = p.read_text()
@@ -41,4 +50,4 @@ test('grid refuses binary-primary-key delete instead of matching a textual hex p
 })
 '''
 p.write_text(s)
-print('Rust scalar types and binary mutation guards corrected.')
+print('SQL executor lifetimes, Rust scalar types and binary mutation guards corrected.')
