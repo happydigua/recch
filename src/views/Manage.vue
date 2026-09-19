@@ -1,13 +1,14 @@
 <script setup lang="ts">
-import { ref, onMounted, computed } from 'vue'
+import { ref, watch, computed, onBeforeUnmount } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { 
-  NLayout, NLayoutSider, NLayoutContent, NTabs, NTabPane, 
-  NResult, NButton, NSpin 
+import {
+  NLayout, NLayoutSider, NLayoutContent, NTabs, NTabPane,
+  NResult, NButton, NSpin
 } from 'naive-ui'
 import { invoke } from '../utils/tauri'
 import { useI18n } from 'vue-i18n'
 import type { ConnectionConfig } from '../types'
+import { quoteIdentifier, sqlDialect } from '../utils/dataGrid'
 import TableList from '../components/TableList.vue'
 import QueryConsole from '../components/QueryConsole.vue'
 import DataGrid from '../components/DataGrid.vue'
@@ -17,52 +18,47 @@ import RedisViewer from '../components/RedisViewer.vue'
 const route = useRoute()
 const router = useRouter()
 const { t } = useI18n()
-const connectionId = route.params.id as string
-
 const loading = ref(true)
 const config = ref<ConnectionConfig | null>(null)
 const activeTab = ref('data')
 const queryRef = ref<InstanceType<typeof QueryConsole> | null>(null)
 const selectedTable = ref('')
 const selectedDatabase = ref<string | undefined>(undefined)
-
 const isRedis = computed(() => config.value?.db_type === 'redis')
+// Keep the saved configuration stable: changing it switches TableList into
+// single-database mode while its existing nodes still contain database prefixes.
+const queryConfig = computed(() => config.value ? {
+  ...config.value,
+  database: selectedDatabase.value ?? config.value.database
+} : null)
+let configRequest = 0
+onBeforeUnmount(() => { configRequest++ })
 
 async function loadConfig() {
+  const request = ++configRequest
+  const connectionId = route.params.id as string
   loading.value = true
+  config.value = null
+  selectedTable.value = ''
+  selectedDatabase.value = undefined
+  activeTab.value = 'data'
   try {
     const connections = await invoke<ConnectionConfig[]>('get_connections')
-    const found = connections.find(c => c.id === connectionId)
-    if (found) {
-      config.value = found
-    } else {
-      // Handle not found
-    }
+    if (request === configRequest) config.value = connections.find(c => c.id === connectionId) ?? null
   } catch (e) {
     console.error(e)
   } finally {
-    loading.value = false
+    if (request === configRequest) loading.value = false
   }
 }
 
 function handleTableSelect(data: { table: string, database?: string }) {
   selectedTable.value = data.table
   selectedDatabase.value = data.database
-  
-  if (data.database && config.value) {
-      config.value = {
-          ...config.value,
-          database: data.database
-      }
-  }
-
-  // Switch to data tab by default now
   activeTab.value = 'data'
-  
-  // Also pre-fill query console if needed
-  if (queryRef.value) {
-      const target = data.table // could be fully qualified
-      queryRef.value.setQuery(`SELECT * FROM ${target} LIMIT 100;`)
+  if (queryRef.value && config.value && !isRedis.value) {
+    const target = quoteIdentifier(data.table, sqlDialect(config.value.db_type))
+    queryRef.value.setQuery(`SELECT * FROM ${target} LIMIT 100;`)
   }
 }
 
@@ -70,9 +66,7 @@ function goBack() {
   router.push('/connections')
 }
 
-onMounted(() => {
-  loadConfig()
-})
+watch(() => route.params.id, () => { void loadConfig() }, { immediate: true })
 </script>
 
 <template>
@@ -80,7 +74,7 @@ onMounted(() => {
     <div v-if="loading" class="loading-state">
       <NSpin size="large" :description="t('common.loading')" />
     </div>
-    
+
     <NResult
       v-else-if="!config"
       status="404"
@@ -92,7 +86,7 @@ onMounted(() => {
       </template>
     </NResult>
 
-    <NLayout v-else has-sider class="layout">
+    <NLayout v-else-if="config && queryConfig" has-sider class="layout">
       <NLayoutSider
         bordered
         width="240"
@@ -106,37 +100,37 @@ onMounted(() => {
             <TableList :config="config" @select="handleTableSelect" />
         </div>
       </NLayoutSider>
-      
+
       <NLayoutContent content-style="padding: 12px 40px 12px 12px; height: 100%; overflow: hidden;">
          <div class="main-content">
             <NTabs v-model:value="activeTab" type="line" animated style="height: 100%; display: flex; flex-direction: column;">
                 <!-- Redis-specific view -->
                 <template v-if="isRedis">
                     <NTabPane name="data" tab="Key 详情" display-directive="show:lazy" style="height: 100%;">
-                        <RedisViewer 
+                        <RedisViewer
                             v-if="selectedTable"
-                            :config="config" 
+                            :config="queryConfig"
                             :selectedKey="selectedTable"
                             :database="selectedDatabase"
                         />
                         <div v-else class="no-selection">选择一个 Key 查看详情</div>
                     </NTabPane>
                     <NTabPane name="query" :tab="t('manage.query')" display-directive="show:lazy" style="height: 100%;">
-                        <QueryConsole 
-                            ref="queryRef" 
-                            :config="config" 
+                        <QueryConsole
+                            ref="queryRef"
+                            :config="queryConfig"
                             :selectedTable="selectedTable"
                             :selectedDatabase="selectedDatabase"
-                            style="height: 100%;" 
+                            style="height: 100%;"
                         />
                     </NTabPane>
                 </template>
                 <!-- SQL Database view -->
                 <template v-else>
                     <NTabPane name="data" :tab="t('manage.data')" display-directive="show:lazy" style="height: 100%;">
-                        <DataGrid 
+                        <DataGrid
                             v-if="selectedTable"
-                            :config="config" 
+                            :config="queryConfig"
                             :table="selectedTable"
                             :database="selectedDatabase"
                         />
@@ -145,19 +139,19 @@ onMounted(() => {
                     <NTabPane name="structure" :tab="t('manage.structure')" display-directive="show:lazy" style="height: 100%;">
                         <TableStructure
                             v-if="selectedTable"
-                            :config="config" 
+                            :config="queryConfig"
                             :table="selectedTable"
                             :database="selectedDatabase"
                         />
                         <div v-else class="no-selection">{{ t('manage.tables') }}</div>
                     </NTabPane>
                     <NTabPane name="query" :tab="t('manage.query')" display-directive="show:lazy" style="height: 100%;">
-                        <QueryConsole 
-                            ref="queryRef" 
-                            :config="config" 
+                        <QueryConsole
+                            ref="queryRef"
+                            :config="queryConfig"
                             :selectedTable="selectedTable"
                             :selectedDatabase="selectedDatabase"
-                            style="height: 100%;" 
+                            style="height: 100%;"
                         />
                     </NTabPane>
                 </template>
