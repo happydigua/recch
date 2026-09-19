@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, watch, h } from 'vue'
+import { ref, computed, watch, h, onBeforeUnmount } from 'vue'
 import { 
   NButton, NDataTable, NSpace, NIcon, useMessage, useDialog, 
   NModal, NForm, NFormItem, NInput, NSelect, NTabs, NTabPane, NCheckbox 
@@ -157,49 +157,37 @@ const indexGridColumns = computed<DataTableColumns<IndexDef>>(() => [
     }
 ])
 
+let disposed = false
+let columnsRequest = 0
+let indexesRequest = 0
+let epoch = 0
+const saving = ref(false)
+const snapshot = () => ({ config: { ...props.config, database: props.database ?? props.config.database }, table: props.table, epoch })
+const current = (target: { epoch: number }) => !disposed && target.epoch === epoch
+onBeforeUnmount(() => { disposed = true; epoch++ })
 async function loadColumns() {
+    const target = snapshot(), ticket = ++columnsRequest
     loading.value = true
-    console.log('Loading columns for:', {
-        table: props.table,
-        database: props.database,
-        config: props.config
-    })
     try {
-        columns.value = await invoke('get_columns', {
-            config: props.config,
-            table: props.table,
-            database: props.database
-        })
-        console.log('Columns loaded:', columns.value)
-    } catch (e) {
-        console.error('Error loading columns:', e)
-        message.error(String(e))
-    } finally {
-        loading.value = false
-    }
+        const result = await invoke<ColumnDef[]>('get_columns', { config: target.config, table: target.table, database: target.config.database })
+        if (current(target) && ticket === columnsRequest) columns.value = result
+    } catch (e) { if (current(target) && ticket === columnsRequest) message.error(String(e)) }
+    finally { if (current(target) && ticket === columnsRequest) loading.value = false }
 }
-
 async function loadIndexes() {
+    const target = snapshot(), ticket = ++indexesRequest
     loadingIndexes.value = true
-    console.log('Loading indexes for:', props.table)
     try {
-        indexes.value = await invoke('get_indexes', {
-            config: props.config,
-            table: props.table
-        })
-        console.log('Indexes loaded:', indexes.value)
-    } catch (e) {
-        console.error('Error loading indexes:', e)
-        message.error(String(e))
-    } finally {
-        loadingIndexes.value = false
-    }
+        const result = await invoke<IndexDef[]>('get_indexes', { config: target.config, table: target.table })
+        if (current(target) && ticket === indexesRequest) indexes.value = result
+    } catch (e) { if (current(target) && ticket === indexesRequest) message.error(String(e)) }
+    finally { if (current(target) && ticket === indexesRequest) loadingIndexes.value = false }
 }
-
-watch(() => props.table, () => {
-    loadColumns()
-    loadIndexes()
-}, { immediate: true })
+watch(() => JSON.stringify([props.config, props.database, props.table]), () => {
+    epoch++; columns.value = []; indexes.value = []
+    showModal.value = false; showIndexModal.value = false; saving.value = false
+    loadColumns(); loadIndexes()
+}, { immediate: true, flush: 'sync' })
 
 function openAdd() {
     modalMode.value = 'add'
@@ -226,140 +214,35 @@ function openAddIndex() {
     showIndexModal.value = true
 }
 
-async function handleIndexSubmit() {
+async function mutate(target: ReturnType<typeof snapshot>, operation: Record<string, unknown>) {
+    if (!current(target) || saving.value) return
+    saving.value = true
     try {
-        await invoke('alter_table', {
-            config: props.config,
-            table: props.table,
-            operation: {
-                op_type: 'add_index',
-                column_name: '', // ignored
-                index_def: {
-                    name: indexForm.value.name,
-                    columns: indexForm.value.columns,
-                    is_unique: indexForm.value.is_unique,
-                    is_pk: false,
-                    comment: null
-                }
-            }
-        })
+        await invoke('alter_table', { config: target.config, table: target.table, operation })
+        if (!current(target)) return
         message.success(t('common.success'))
-        showIndexModal.value = false
-        loadIndexes()
-    } catch (e: any) {
-         message.error(t('common.error') + ': ' + e.toString())
-    }
+        showModal.value = false; showIndexModal.value = false
+        await Promise.all([loadColumns(), loadIndexes()])
+    } catch (e) { if (current(target)) message.error(String(e)) }
+    finally { if (current(target)) saving.value = false }
 }
-
+async function handleIndexSubmit() {
+    await mutate(snapshot(), { op_type: 'add_index', index_def: { ...indexForm.value, columns: [...indexForm.value.columns], is_pk: false, comment: null } })
+}
 function handleDropIndex(row: IndexDef) {
-     dialog.warning({
-        title: t('common.delete'),
-        content: `Drop index ${row.name}?`,
-        positiveText: t('common.delete'),
-        negativeText: t('common.cancel'),
-        onPositiveClick: async () => {
-             try {
-                await invoke('alter_table', {
-                    config: props.config,
-                    table: props.table,
-                    operation: {
-                        op_type: 'drop_index',
-                        index_name: row.name,
-                        column_name: '' // ignored
-                    }
-                })
-                message.success(t('common.success'))
-                loadIndexes()
-            } catch (e) {
-                message.error(String(e))
-            }
-        }
-    })
+    const target = snapshot(), name = row.name
+    dialog.warning({ title: t('common.delete'), content: `Drop index ${name}?`, positiveText: t('common.delete'), negativeText: t('common.cancel'),
+        onPositiveClick: () => mutate(target, { op_type: 'drop_index', index_name: name }) })
 }
-
 function handleDrop(row: ColumnDef) {
-    dialog.warning({
-        title: t('common.delete'),
-        content: t('structure.drop_confirm', { name: row.name }),
-        positiveText: t('common.delete'),
-        negativeText: t('common.cancel'),
-        onPositiveClick: async () => {
-             try {
-                await invoke('alter_table', {
-                    config: props.config,
-                    table: props.table,
-                    operation: {
-                        op_type: 'drop',
-                        column_name: row.name,
-                    }
-                })
-                message.success(t('common.success'))
-                loadColumns()
-            } catch (e) {
-                message.error(String(e))
-            }
-        }
-    })
+    const target = snapshot(), name = row.name
+    dialog.warning({ title: t('common.delete'), content: t('structure.drop_confirm', { name }), positiveText: t('common.delete'), negativeText: t('common.cancel'),
+        onPositiveClick: () => mutate(target, { op_type: 'drop', column_name: name }) })
 }
-
 async function handleSubmit() {
-    try {
-        if (modalMode.value === 'add') {
-             await invoke('alter_table', {
-                config: props.config,
-                table: props.table,
-                operation: {
-                    op_type: 'add',
-                    column_name: formModel.value.name,
-                    column_def: {
-                        name: formModel.value.name,
-                        type_name: formModel.value.type_name,
-                        is_pk: formModel.value.is_pk,
-                        is_nullable: formModel.value.is_nullable,
-                        default_value: formModel.value.default_value || null,
-                        comment: formModel.value.comment || null
-                    }
-                }
-            })
-            message.success(t('common.success'))
-        } else {
-             // If name changed -> Rename
-             if (formModel.value.name !== originalName.value) {
-                  await invoke('alter_table', {
-                    config: props.config,
-                    table: props.table,
-                    operation: {
-                        op_type: 'rename',
-                        column_name: originalName.value,
-                        new_name: formModel.value.name
-                    }
-                })
-             }
-             
-             // Modify
-             await invoke('alter_table', {
-                config: props.config,
-                table: props.table,
-                operation: {
-                    op_type: 'modify',
-                    column_name: formModel.value.name,
-                    column_def: {
-                        name: formModel.value.name,
-                        type_name: formModel.value.type_name,
-                        is_pk: false, // preserving non-pk assumption for now
-                        is_nullable: formModel.value.is_nullable,
-                        default_value: formModel.value.default_value || null,
-                        comment: formModel.value.comment || null
-                    }
-                }
-            })
-            message.success(t('common.success'))
-        }
-        showModal.value = false
-        loadColumns()
-    } catch (e: any) {
-        message.error(t('common.error') + ': ' + e.toString())
-    }
+    const column = { ...formModel.value, default_value: formModel.value.default_value || null, comment: formModel.value.comment || null }
+    // Rename and modify are one backend operation, not two independently committed calls.
+    await mutate(snapshot(), { op_type: modalMode.value === 'add' ? 'add' : 'modify', column_name: modalMode.value === 'add' ? column.name : originalName.value, column_def: column })
 }
 </script>
 
@@ -455,7 +338,7 @@ async function handleSubmit() {
              </NForm>
               <template #action>
                 <NButton @click="showModal = false">{{ t('common.cancel') }}</NButton>
-                <NButton type="primary" @click="handleSubmit">{{ t('common.save') }}</NButton>
+                <NButton type="primary" :loading="saving" @click="handleSubmit">{{ t('common.save') }}</NButton>
             </template>
         </NModal>
         
@@ -479,7 +362,7 @@ async function handleSubmit() {
              </NForm>
               <template #action>
                 <NButton @click="showIndexModal = false">{{ t('common.cancel') }}</NButton>
-                <NButton type="primary" @click="handleIndexSubmit">{{ t('common.save') }}</NButton>
+                <NButton type="primary" :loading="saving" @click="handleIndexSubmit">{{ t('common.save') }}</NButton>
             </template>
         </NModal>
     </div>

@@ -5,7 +5,7 @@ export const isTauri = () => {
 
 export const invoke = async <T>(cmd: string, args?: Record<string, unknown>): Promise<T> => {
     if (!isTauri()) {
-        console.warn(`[Tauri] Mock invoke for command "${cmd}"`, args);
+        console.warn(`[Tauri] Desktop runtime unavailable for command "${cmd}"`);
         return Promise.reject(new Error("Tauri not available"));
     }
 

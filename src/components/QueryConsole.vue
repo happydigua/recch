@@ -1,8 +1,8 @@
 <script setup lang="ts">
-import { ref, watch, computed } from 'vue'
+import { ref, watch, computed, onBeforeUnmount } from 'vue'
 import { 
   NCard, NInput, NButton, NSpace, NDataTable, 
-  NIcon, useMessage, NAlert, NModal, NFormItem
+  NIcon, useMessage, NAlert, NModal, NFormItem, NCheckbox
 } from 'naive-ui'
 import { PlayOutline, SparklesOutline, SettingsOutline } from '@vicons/ionicons5'
 import { invoke } from '../utils/tauri'
@@ -40,6 +40,19 @@ const showAIModal = ref(false)
 const showAIConfigModal = ref(false)
 const aiPrompt = ref('')
 const aiLoading = ref(false)
+const aiConsent = ref(false)
+const aiEndpoint = ref('')
+let epoch = 0
+let disposed = false
+onBeforeUnmount(() => { disposed = true; epoch++ })
+watch(() => JSON.stringify([props.config, props.selectedDatabase, props.selectedTable]), () => {
+  epoch++
+  results.value = []; error.value = ''; lastQuery.value = ''
+  loading.value = false; aiLoading.value = false
+  aiConsent.value = false; showAIModal.value = false
+}, { flush: 'sync' })
+const isCurrent = (ticket: number) => !disposed && ticket === epoch
+
 
 watch(() => props.initialQuery, (newVal) => {
   if (newVal) {
@@ -68,76 +81,64 @@ const columns = computed(() => {
 })
 
 async function runQuery() {
-  if (!query.value.trim()) return
-  
-  loading.value = true
-  error.value = ''
-  results.value = []
+  if (!query.value.trim() || loading.value) return
+  const ticket = epoch
+  const sql = query.value
+  const config = { ...props.config, database: props.selectedDatabase ?? props.config.database }
+  loading.value = true; error.value = ''; results.value = []
   const start = performance.now()
-  
   try {
-    const data = await invoke<any[]>('execute_query', { 
-      config: props.config, 
-      query: query.value 
-    })
-    results.value = data.map((item: any, index: number) => ({ ...item, __id: index }))
-    lastQuery.value = query.value
+    const data = await invoke<any[]>('execute_query', { config, query: sql })
+    if (!isCurrent(ticket)) return
+    results.value = data.map((item, index) => ({ ...item, __id: index }))
+    lastQuery.value = sql
     executionTime.value = Math.round(performance.now() - start)
-    message.success(t('manage.query_success', { time: executionTime.value, rows: data.length }))
-  } catch (err: any) {
-    error.value = err.toString()
+    if (config.db_type === 'redis' && data.some(item => item.error)) {
+      error.value = 'Redis 批次包含失败命令；请检查结果。之前成功执行的命令不会自动撤销。'
+    } else message.success(t('manage.query_success', { time: executionTime.value, rows: data.length }))
+  } catch (err) {
+    if (isCurrent(ticket)) error.value = String(err)
   } finally {
-    loading.value = false
+    if (isCurrent(ticket)) loading.value = false
   }
 }
 
-function openAIModal() {
-  aiPrompt.value = ''
-  showAIModal.value = true
+async function openAIModal() {
+  const ticket = epoch
+  aiPrompt.value = ''; aiConsent.value = false; aiEndpoint.value = ''
+  try {
+    const settings = await invoke<{ api_url: string }>('get_ai_config')
+    if (!isCurrent(ticket)) return
+    aiEndpoint.value = settings.api_url
+    showAIModal.value = true
+  } catch (err) { if (isCurrent(ticket)) message.error(String(err)) }
 }
 
 async function generateSQL() {
-  if (!aiPrompt.value.trim()) {
-    message.warning(t('ai.enter_prompt'))
-    return
-  }
-  
+  if (aiLoading.value || !aiConsent.value) return
+  if (!aiPrompt.value.trim()) { message.warning(t('ai.enter_prompt')); return }
+  const ticket = epoch
+  const config = { ...props.config }
+  const table = props.selectedTable
+  const database = props.selectedDatabase
+  const prompt = aiPrompt.value
+  const expectedApiUrl = aiEndpoint.value
   aiLoading.value = true
   try {
-    // Get table schema for the current table
-    let tableSchemas = ''
-    if (props.selectedTable) {
-      try {
-        const columns = await invoke<ColumnDef[]>('get_columns', {
-          config: props.config,
-          table: props.selectedTable,
-          database: props.selectedDatabase
-        })
-        tableSchemas = `表名: ${props.selectedTable}\n字段:\n` + 
-          columns.map(c => `  - ${c.name} (${c.type_name})${c.is_pk ? ' [主键]' : ''}${c.is_nullable === false ? ' [非空]' : ''}`).join('\n')
-      } catch (e) {
-        console.error('Failed to get columns:', e)
-      }
+    let tableSchemas = '(未选择表，请根据常见数据库结构生成通用查询)'
+    if (table) {
+      const columns = await invoke<ColumnDef[]>('get_columns', { config, table, database })
+      if (!isCurrent(ticket)) return
+      tableSchemas = `表名: ${table}\n字段:\n` + columns.map(c => `  - ${c.name} (${c.type_name})${c.is_pk ? ' [主键]' : ''}`).join('\n')
     }
-    
-    if (!tableSchemas) {
-      tableSchemas = '(未选择表，请根据常见数据库结构生成通用查询)'
-    }
-    
     const sql = await invoke<string>('generate_sql_from_text', {
-      dbType: props.config.db_type,
-      tableSchemas: tableSchemas,
-      userRequest: aiPrompt.value
+      dbType: config.db_type, tableSchemas, userRequest: prompt, consent: true, expectedApiUrl
     })
-    
-    query.value = sql
-    showAIModal.value = false
+    if (!isCurrent(ticket)) return
+    query.value = sql; showAIModal.value = false
     message.success(t('ai.sql_generated'))
-  } catch (err: any) {
-    message.error(err.toString())
-  } finally {
-    aiLoading.value = false
-  }
+  } catch (err) { if (isCurrent(ticket)) message.error(String(err)) }
+  finally { if (isCurrent(ticket)) aiLoading.value = false }
 }
 
 // Expose run function if parent wants to trigger it
@@ -153,6 +154,7 @@ defineExpose({
       <div class="editor-area">
         <NInput
             v-model:value="query"
+            :disabled="aiLoading"
             type="textarea"
             :placeholder="t('manage.query_placeholder')"
             :autosize="{ minRows: 4, maxRows: 8 }"
@@ -203,6 +205,11 @@ defineExpose({
     
     <!-- AI Generate SQL Modal -->
     <NModal v-model:show="showAIModal" preset="card" :title="t('ai.generate_sql')" style="width: 500px;">
+      <NAlert type="warning" style="margin-bottom: 12px;">
+        AI 请求会把提示词、表名和字段结构发送到：{{ aiEndpoint || '默认通义千问服务' }}。不要填写敏感业务数据。
+        生成的语句可能修改或删除数据，请先审阅；不会自动执行。
+      </NAlert>
+      <NCheckbox v-model:checked="aiConsent" style="margin-bottom: 12px;">同意将上述内容发送到该 AI 服务</NCheckbox>
       <NFormItem :label="t('ai.describe_query')">
         <NInput 
           v-model:value="aiPrompt" 
@@ -217,7 +224,7 @@ defineExpose({
       <template #footer>
         <NSpace justify="end">
           <NButton @click="showAIModal = false">{{ t('common.cancel') }}</NButton>
-          <NButton type="primary" @click="generateSQL" :loading="aiLoading">
+          <NButton type="primary" @click="generateSQL" :loading="aiLoading" :disabled="!aiConsent">
             <template #icon><NIcon><SparklesOutline /></NIcon></template>
             {{ t('ai.generate') }}
           </NButton>

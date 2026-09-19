@@ -183,6 +183,7 @@ defineExpose({
         </div>
       </div>
       
+      <p v-if="isRedis" style="font-size: 12px;">Key 浏览最多显示 1000 项；使用查询控制台的 SCAN 继续检查。</p>
       <div class="search-box">
         <NInput v-model:value="searchText" :placeholder="t('common.search')" size="small">
           <template #prefix>

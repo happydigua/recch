@@ -21,7 +21,6 @@ struct PoolKey {
 pub enum PoolEntry {
     MySql(MySqlPool),
     Postgres(PgPool),
-    Redis(redis::aio::MultiplexedConnection),
 }
 
 /// Manages connection pools for all active database connections
@@ -45,19 +44,27 @@ impl PoolManager {
             port: config.port,
             username: config.username.clone(),
             password: config.password.clone(),
-            database: database.or(config.database.as_deref()).unwrap_or("").to_string(),
+            database: database
+                .or(config.database.as_deref())
+                .unwrap_or("")
+                .to_string(),
         }
     }
 
     fn mysql_options(config: &ConnectionConfig, database: Option<&str>) -> MySqlConnectOptions {
-        let mut options = MySqlConnectOptions::new().host(&config.host).port(config.port);
+        let mut options = MySqlConnectOptions::new()
+            .host(&config.host)
+            .port(config.port);
         if let Some(username) = &config.username {
             options = options.username(username);
         }
         if let Some(password) = &config.password {
             options = options.password(password);
         }
-        if let Some(database) = database.or(config.database.as_deref()).filter(|db| !db.is_empty()) {
+        if let Some(database) = database
+            .or(config.database.as_deref())
+            .filter(|db| !db.is_empty())
+        {
             options = options.database(database);
         }
         options
@@ -71,7 +78,10 @@ impl PoolManager {
         if let Some(password) = &config.password {
             options = options.password(password);
         }
-        if let Some(database) = database.or(config.database.as_deref()).filter(|db| !db.is_empty()) {
+        if let Some(database) = database
+            .or(config.database.as_deref())
+            .filter(|db| !db.is_empty())
+        {
             options = options.database(database);
         }
         options
@@ -92,14 +102,10 @@ impl PoolManager {
             }
         }
 
-        let mut pools = self.pools.write().await;
-        if let Some(PoolEntry::MySql(pool)) = pools.get(&key) {
-            return Ok(pool.clone());
-        }
-
         // Use structured options, like test_connection, rather than a URL with
         // unescaped usernames/database names (or an unbracketed IPv6 address).
         let pool = MySqlPoolOptions::new()
+            .acquire_timeout(std::time::Duration::from_secs(10))
             .max_connections(5)
             .min_connections(1)
             .idle_timeout(std::time::Duration::from_secs(300))
@@ -107,6 +113,13 @@ impl PoolManager {
             .await
             .map_err(|e| e.to_string())?;
 
+        let mut pools = self.pools.write().await;
+        if let Some(PoolEntry::MySql(existing)) = pools.get(&key) {
+            let existing = existing.clone();
+            drop(pools);
+            pool.close().await;
+            return Ok(existing);
+        }
         pools.insert(key, PoolEntry::MySql(pool.clone()));
         Ok(pool)
     }
@@ -126,12 +139,8 @@ impl PoolManager {
             }
         }
 
-        let mut pools = self.pools.write().await;
-        if let Some(PoolEntry::Postgres(pool)) = pools.get(&key) {
-            return Ok(pool.clone());
-        }
-
         let pool = PgPoolOptions::new()
+            .acquire_timeout(std::time::Duration::from_secs(10))
             .max_connections(5)
             .min_connections(1)
             .idle_timeout(std::time::Duration::from_secs(300))
@@ -139,52 +148,23 @@ impl PoolManager {
             .await
             .map_err(|e| e.to_string())?;
 
+        let mut pools = self.pools.write().await;
+        if let Some(PoolEntry::Postgres(existing)) = pools.get(&key) {
+            let existing = existing.clone();
+            drop(pools);
+            pool.close().await;
+            return Ok(existing);
+        }
         pools.insert(key, PoolEntry::Postgres(pool.clone()));
         Ok(pool)
     }
 
-    /// Get or create a Redis multiplexed connection
+    /// Redis commands need an exclusive session, not a shared multiplexed cache.
     pub async fn get_redis_conn(
         &self,
         config: &ConnectionConfig,
     ) -> Result<redis::aio::MultiplexedConnection, String> {
-        let key = Self::pool_key(config, None);
-
-        {
-            let pools = self.pools.read().await;
-            if let Some(PoolEntry::Redis(conn)) = pools.get(&key) {
-                return Ok(conn.clone());
-            }
-        }
-
-        let mut pools = self.pools.write().await;
-        if let Some(PoolEntry::Redis(conn)) = pools.get(&key) {
-            return Ok(conn.clone());
-        }
-
-        let url = if let Some(pass) = &config.password {
-            if !pass.is_empty() {
-                format!(
-                    "redis://:{}@{}:{}/",
-                    urlencoding::encode(pass),
-                    config.host,
-                    config.port
-                )
-            } else {
-                format!("redis://{}:{}/", config.host, config.port)
-            }
-        } else {
-            format!("redis://{}:{}/", config.host, config.port)
-        };
-
-        let client = redis::Client::open(url).map_err(|e| e.to_string())?;
-        let conn = client
-            .get_multiplexed_async_connection()
-            .await
-            .map_err(|e| e.to_string())?;
-
-        pools.insert(key, PoolEntry::Redis(conn.clone()));
-        Ok(conn)
+        crate::redis_support::connect(config).await
     }
 
     /// Remove this saved connection's pools, including previous configurations.
@@ -231,8 +211,13 @@ mod tests {
         let original = config();
         let mut renamed = original.clone();
         renamed.name = "Renamed".into();
-        assert!(PoolManager::pool_key(&original, None) == PoolManager::pool_key(&renamed, Some("app")));
-        assert!(PoolManager::pool_key(&original, None) != PoolManager::pool_key(&original, Some("other")));
+        assert!(
+            PoolManager::pool_key(&original, None) == PoolManager::pool_key(&renamed, Some("app"))
+        );
+        assert!(
+            PoolManager::pool_key(&original, None)
+                != PoolManager::pool_key(&original, Some("other"))
+        );
     }
 
     #[test]
@@ -275,7 +260,10 @@ mod tests {
                 .min_connections(0)
                 .connect_lazy("mysql://localhost/other")
                 .unwrap();
-            pools.insert(PoolManager::pool_key(&original, Some("other")), PoolEntry::MySql(pool));
+            pools.insert(
+                PoolManager::pool_key(&original, Some("other")),
+                PoolEntry::MySql(pool),
+            );
         }
         let mut edited = original.clone();
         edited.host = "new-host".into();

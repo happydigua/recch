@@ -39,11 +39,11 @@
 - **Query Console**: Execute raw SQL/Redis commands with syntax highlighting.
 - **Column Comments**: View field descriptions inline (just like DBeaver!).
 - **Database Export / Import**: Run full database export or import directly from the connection list.
-- **Export Progress Feedback**: Large database exports show percentage, current table progress, and support stopping mid-run.
+- **Safe Native Export**: Compatible `pg_dump` / MySQL 8 `mysqldump` is required on PATH. A running indicator and stop button are shown; failed exports preserve the previous destination.
 
 ### 🔒 Secure & Private
 - **100% Local**: All connection credentials stored locally on your machine.
-- **No Cloud Sync**: Your data never leaves your device.
+- **No Automatic Cloud Sync**: Settings are local. Remote database connections and explicitly approved AI requests send data to the configured endpoints. See [SECURITY.md](SECURITY.md).
 - **Open Source**: Fully transparent codebase you can audit and trust.
 
 ### 🖥️ Cross-Platform Native Performance
@@ -67,7 +67,7 @@
 ## 🆕 Recent Updates
 
 - Database-level export and import are available from the connection list for MySQL and PostgreSQL.
-- Export progress now shows percentage, current table progress, and a stop button for long-running tasks.
+- Native export uses an indeterminate progress indicator and a stop button, without inventing a percentage.
 - Large table export behavior has been improved to keep progress feedback more stable during long runs.
 
 ---
@@ -88,11 +88,15 @@ Download the latest release for your platform:
 
 ---
 
+## Backup prerequisites
+
+Install `pg_dump` matching your PostgreSQL server major version, or Oracle MySQL 8 `mysqldump`, and make it available on PATH. Native tools are not bundled into RECCH. Large or client-specific restore scripts should be restored with the matching database client. See [data-safety boundaries](SECURITY.md) before production use.
+
 ## 🧑‍💻 Development
 
 ### Prerequisites
 
-- Node.js (v16+)
+- Node.js (v22.13+)
 - Rust (Stable)
 - Platform-specific dependencies (see [Tauri v2 Prerequisites](https://v2.tauri.app/start/prerequisites/))
 
@@ -168,11 +172,11 @@ MIT License. See [LICENSE](LICENSE) for details.
 - **查询控制台**：执行原生 SQL/Redis 命令，支持语法高亮。
 - **字段注释显示**：像 DBeaver 一样直接显示字段备注。
 - **数据库级导出 / 导入**：可直接在连接列表里执行整库导出和导入。
-- **导出进度反馈**：大库导出时显示百分比、当前表进度，并支持中途停止。
+- **安全原生导出**：需要 PATH 中的兼容 `pg_dump` / MySQL 8 `mysqldump`；显示运行状态并支持停止，失败时保留原目标文件。
 
 ### 🔒 安全与隐私
 - **100% 本地化**：所有连接凭证存储在本地。
-- **无云同步**：数据永远不离开你的设备。
+- **无自动云同步**：配置保存在本机；远程数据库连接及明确同意的 AI 请求会向所配置的服务发送数据，详见 [SECURITY.md](SECURITY.md)。
 - **开源透明**：代码完全开放，值得信赖。
 
 ### 🖥️ 跨平台原生性能
@@ -196,7 +200,7 @@ MIT License. See [LICENSE](LICENSE) for details.
 ## 🆕 最近更新
 
 - MySQL 和 PostgreSQL 已支持在连接列表中直接进行数据库级导出与导入。
-- 数据库导出现在会显示百分比、当前表进度，并支持手动停止。
+- 原生导出显示运行状态并支持手动停止；不显示无法准确计算的百分比。
 - 大表导出流程已优化，长时间导出时的进度反馈更稳定。
 
 ---
@@ -217,11 +221,15 @@ MIT License. See [LICENSE](LICENSE) for details.
 
 ---
 
+## 备份工具要求
+
+请安装与 PostgreSQL 服务端主版本匹配的 `pg_dump`，或 Oracle MySQL 8 `mysqldump`，并加入 PATH。RECCH 不内置这些工具。大文件或带客户端专用语法的恢复脚本，请使用匹配的数据库原生客户端。用于生产前请阅读 [安全与数据保护边界](SECURITY.md)。
+
 ## 🧑‍💻 开发指南
 
 ### 环境要求
 
-- Node.js (v16+)
+- Node.js (v22.13+)
 - Rust (Stable)
 - 平台特定依赖 (参见 [Tauri v2 环境准备](https://v2.tauri.app/start/prerequisites/))
 

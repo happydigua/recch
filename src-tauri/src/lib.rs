@@ -1,6 +1,6 @@
+use futures_util::TryStreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use futures_util::TryStreamExt;
 use sqlx::mysql::MySqlConnectOptions;
 use sqlx::mysql::MySqlRow;
 use sqlx::postgres::PgConnectOptions;
@@ -8,7 +8,6 @@ use sqlx::postgres::PgRow;
 use sqlx::raw_sql;
 use sqlx::ConnectOptions;
 use std::fs;
-use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -22,10 +21,14 @@ use tauri::{Emitter, Manager};
 use tokio::sync::RwLock;
 
 mod ai_service;
+mod config_store;
+mod native_backup;
 mod pool_manager;
+mod redis_support;
+mod schema;
 use pool_manager::PoolManager;
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct ConnectionConfig {
     pub id: String,
     pub name: String,
@@ -73,11 +76,14 @@ impl ExportTaskManager {
         }
     }
 
-    async fn start_task(&self, task_id: &str) -> Arc<AtomicBool> {
+    async fn start_task(&self, task_id: &str) -> Result<Arc<AtomicBool>, String> {
         let cancel_flag = Arc::new(AtomicBool::new(false));
         let mut tasks = self.tasks.write().await;
+        if tasks.contains_key(task_id) {
+            return Err("Export task already exists".into());
+        }
         tasks.insert(task_id.to_string(), cancel_flag.clone());
-        cancel_flag
+        Ok(cancel_flag)
     }
 
     async fn cancel_task(&self, task_id: &str) -> bool {
@@ -100,24 +106,6 @@ fn emit_export_progress(app_handle: &tauri::AppHandle, payload: DatabaseExportPr
     let _ = app_handle.emit("database-export-progress", payload);
 }
 
-fn calculate_progress(processed_units: usize, total_units: usize, status: &str) -> u8 {
-    if status == "completed" {
-        return 100;
-    }
-    if total_units == 0 {
-        return 0;
-    }
-    (((processed_units.saturating_mul(100)) / total_units).min(99)) as u8
-}
-
-fn ensure_not_cancelled(cancel_flag: &AtomicBool) -> Result<(), String> {
-    if cancel_flag.load(Ordering::Relaxed) {
-        Err("Export cancelled".to_string())
-    } else {
-        Ok(())
-    }
-}
-
 fn resolve_target_database(
     config: &ConnectionConfig,
     database: Option<&str>,
@@ -125,9 +113,8 @@ fn resolve_target_database(
     let db = database
         .or(config.database.as_deref())
         .unwrap_or("")
-        .trim()
         .to_string();
-    if db.is_empty() {
+    if db.trim().is_empty() || db.contains('\0') {
         Err("No database selected".to_string())
     } else {
         Ok(db)
@@ -142,285 +129,131 @@ fn quote_pg_identifier(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
 
-fn escape_sql_string(value: &str, db_type: &str) -> String {
-    let escaped = value.replace('\'', "''");
-    if db_type == "mysql" {
-        escaped.replace('\\', "\\\\")
+fn exact_integer(value: i128) -> Value {
+    const MAX_SAFE: i128 = 9_007_199_254_740_991;
+    if (-MAX_SAFE..=MAX_SAFE).contains(&value) {
+        json!(value as i64)
     } else {
-        escaped
+        Value::String(value.to_string())
     }
 }
 
-fn sql_literal(value: Option<&Value>, db_type: &str) -> String {
-    match value {
-        None | Some(Value::Null) => "NULL".to_string(),
-        Some(Value::Bool(v)) => {
-            if db_type == "mysql" {
-                if *v { "1".to_string() } else { "0".to_string() }
-            } else if *v {
-                "TRUE".to_string()
-            } else {
-                "FALSE".to_string()
-            }
-        }
-        Some(Value::Number(v)) => v.to_string(),
-        Some(Value::String(v)) => format!("'{}'", escape_sql_string(v, db_type)),
-        Some(Value::Array(v)) => format!(
-            "'{}'",
-            escape_sql_string(&serde_json::to_string(v).unwrap_or_else(|_| "[]".to_string()), db_type)
-        ),
-        Some(Value::Object(v)) => format!(
-            "'{}'",
-            escape_sql_string(&serde_json::to_string(v).unwrap_or_else(|_| "{}".to_string()), db_type)
-        ),
+fn finite_float(value: f64) -> Value {
+    if value.is_finite() {
+        json!(value)
+    } else {
+        Value::String(value.to_string())
     }
 }
 
-fn normalize_pg_column_definition(
-    data_type: &str,
-    default_value: Option<&str>,
-) -> (String, Option<String>, bool) {
-    if let Some(default) = default_value {
-        if default.starts_with("nextval(") {
-            let normalized_type = match data_type {
-                "smallint" => "smallserial".to_string(),
-                "bigint" => "bigserial".to_string(),
-                _ => "serial".to_string(),
-            };
-            return (normalized_type, None, true);
-        }
-    }
-
-    (
-        data_type.to_string(),
-        default_value.map(|v| v.to_string()),
-        false,
-    )
+fn hex_bytes(value: Vec<u8>) -> Value {
+    // Never truncate stored values. Preview truncation belongs in the renderer.
+    Value::String(format!(
+        "0x{}",
+        value
+            .iter()
+            .map(|b| format!("{:02X}", b))
+            .collect::<String>()
+    ))
 }
 
-fn mysql_row_to_json_map(row: &MySqlRow) -> HashMap<String, Value> {
+fn mysql_row_to_json_map(row: &MySqlRow) -> Result<HashMap<String, Value>, String> {
     let mut map = HashMap::new();
-
     for col in row.columns() {
         let name = col.name();
-        let type_name = col.type_info().name();
-
-        let value: Value = match type_name {
-            "BOOLEAN" | "BOOL" => {
-                let v: Option<bool> = row.try_get(col.ordinal()).unwrap_or(None);
-                json!(v)
-            }
-            _ if type_name.starts_with("TINYINT")
-                || type_name.starts_with("SMALLINT")
-                || type_name.starts_with("INT")
-                || type_name.starts_with("INTEGER")
-                || type_name.starts_with("BIGINT")
-                || type_name.starts_with("MEDIUMINT")
-                || type_name == "INT4"
-                || type_name == "INT8" =>
+        let kind = col.type_info().name();
+        if map.contains_key(name) {
+            return Err(format!(
+                "Duplicate result column '{}'; use distinct SQL aliases",
+                name
+            ));
+        }
+        macro_rules! get { ($ty:ty) => { row.try_get::<Option<$ty>, _>(col.ordinal())
+            .map_err(|_| format!("Cannot decode column '{}' ({}) without data loss; cast it explicitly in SQL", name, kind))? }; }
+        let value = match kind {
+            "BOOLEAN" | "BOOL" => get!(i64)
+                .map(|v| exact_integer(v as i128))
+                .unwrap_or(Value::Null),
+            kind if ["TINYINT", "SMALLINT", "MEDIUMINT", "INT", "BIGINT"]
+                .iter()
+                .any(|prefix| kind.starts_with(prefix)) =>
             {
-                if let Ok(v) = row.try_get::<Option<i64>, _>(col.ordinal()) {
-                    json!(v)
-                } else if let Ok(v) = row.try_get::<Option<u64>, _>(col.ordinal()) {
-                    json!(v)
-                } else if let Ok(v) = row.try_get::<Option<i32>, _>(col.ordinal()) {
-                    json!(v)
-                } else if let Ok(v) = row.try_get::<Option<i8>, _>(col.ordinal()) {
-                    json!(v)
+                if kind.contains("UNSIGNED") {
+                    get!(u64)
+                        .map(|v| exact_integer(v as i128))
+                        .unwrap_or(Value::Null)
                 } else {
-                    match row.try_get::<Option<String>, _>(col.ordinal()) {
-                        Ok(v) => json!(v),
-                        Err(_) => Value::Null,
-                    }
+                    get!(i64)
+                        .map(|v| exact_integer(v as i128))
+                        .unwrap_or(Value::Null)
                 }
             }
-            "FLOAT" | "DOUBLE" | "REAL" | "NUMERIC" => {
-                let v: Option<f64> = row.try_get(col.ordinal()).unwrap_or(None);
-                json!(v)
+            "DECIMAL" | "NEWDECIMAL" | "NUMERIC" => {
+                json!(get!(sqlx::types::BigDecimal).map(|v| v.to_string()))
             }
-            "BIT" => {
-                if let Ok(v) = row.try_get::<Option<u64>, _>(col.ordinal()) {
-                    json!(v)
-                } else {
-                    match row.try_get::<Option<Vec<u8>>, _>(col.ordinal()) {
-                        Ok(Some(v)) => {
-                            let hex: String =
-                                v.iter().map(|b| format!("{:02X}", b)).collect();
-                            json!(format!("0x{}", hex))
-                        }
-                        Ok(None) => Value::Null,
-                        Err(_) => Value::Null,
-                    }
-                }
+            "FLOAT" => get!(f32)
+                .map(|v| finite_float(v as f64))
+                .unwrap_or(Value::Null),
+            "DOUBLE" | "REAL" => get!(f64).map(finite_float).unwrap_or(Value::Null),
+            "JSON" => json!(get!(Value).map(|v| v.to_string())),
+            "TIMESTAMP" | "DATETIME" => json!(get!(chrono::NaiveDateTime).map(|v| v.to_string())),
+            "DATE" => json!(get!(chrono::NaiveDate).map(|v| v.to_string())),
+            "TIME" => json!(get!(chrono::NaiveTime).map(|v| v.to_string())),
+            "YEAR" => json!(get!(u16)),
+            "BIT" => get!(u64)
+                .map(|v| exact_integer(v as i128))
+                .unwrap_or(Value::Null),
+            kind if kind.contains("BINARY") || kind.contains("BLOB") => {
+                get!(Vec<u8>).map(hex_bytes).unwrap_or(Value::Null)
             }
-            "JSON" => match row.try_get::<Option<serde_json::Value>, _>(col.ordinal()) {
-                Ok(v) => json!(v),
-                Err(_) => Value::Null,
-            },
-            "TIMESTAMP" | "DATETIME" => {
-                match row.try_get::<Option<chrono::NaiveDateTime>, _>(col.ordinal()) {
-                    Ok(Some(v)) => json!(v.to_string()),
-                    Ok(None) => Value::Null,
-                    Err(_) => match row.try_get::<Option<String>, _>(col.ordinal()) {
-                        Ok(v) => json!(v),
-                        Err(_) => Value::Null,
-                    },
-                }
-            }
-            "DATE" => match row.try_get::<Option<chrono::NaiveDate>, _>(col.ordinal()) {
-                Ok(Some(v)) => json!(v.to_string()),
-                Ok(None) => Value::Null,
-                Err(_) => Value::Null,
-            },
-            "TIME" => match row.try_get::<Option<chrono::NaiveTime>, _>(col.ordinal()) {
-                Ok(Some(v)) => json!(v.to_string()),
-                Ok(None) => Value::Null,
-                Err(_) => Value::Null,
-            },
-            "YEAR" => match row.try_get::<Option<i32>, _>(col.ordinal()) {
-                Ok(Some(v)) => json!(v),
-                Ok(None) => Value::Null,
-                Err(_) => match row.try_get::<Option<String>, _>(col.ordinal()) {
-                    Ok(v) => json!(v),
-                    Err(_) => Value::Null,
-                },
-            },
-            _ if type_name.to_uppercase().contains("BINARY")
-                || type_name.to_uppercase().contains("BLOB")
-                || type_name.to_uppercase().contains("BYTEA") =>
-            {
-                match row.try_get::<Option<Vec<u8>>, _>(col.ordinal()) {
-                    Ok(Some(v)) => {
-                        let hex: String =
-                            v.iter().take(32).map(|b| format!("{:02X}", b)).collect();
-                        let suffix = if v.len() > 32 {
-                            format!("... ({} bytes)", v.len())
-                        } else {
-                            String::new()
-                        };
-                        json!(format!("0x{}{}", hex, suffix))
-                    }
-                    Ok(None) => Value::Null,
-                    Err(_) => Value::Null,
-                }
-            }
-            _ => match row.try_get::<Option<String>, _>(col.ordinal()) {
-                Ok(v) => json!(v),
-                Err(_) => match row.try_get::<Option<Vec<u8>>, _>(col.ordinal()) {
-                    Ok(Some(v)) => {
-                        let hex: String =
-                            v.iter().take(16).map(|b| format!("{:02X}", b)).collect();
-                        let suffix = if v.len() > 16 { "..." } else { "" };
-                        json!(format!("[BLOB: 0x{}{}]", hex, suffix))
-                    }
-                    Ok(None) => Value::Null,
-                    Err(_) => Value::Null,
-                },
-            },
+            _ => json!(get!(String)),
         };
-
         map.insert(name.to_string(), value);
     }
-
-    map
+    Ok(map)
 }
 
-fn pg_row_to_json_map(row: &PgRow) -> HashMap<String, Value> {
+fn pg_row_to_json_map(row: &PgRow) -> Result<HashMap<String, Value>, String> {
     let mut map = HashMap::new();
-
     for col in row.columns() {
         let name = col.name();
-        let type_name = col.type_info().name();
-
-        let value: Value = match type_name {
-            "BOOL" => {
-                let v: Option<bool> = row.try_get(col.ordinal()).unwrap_or(None);
-                json!(v)
-            }
-            "INT2" | "INT4" | "INT8" => {
-                let v: Option<i64> = row.try_get(col.ordinal()).unwrap_or(None);
-                json!(v)
-            }
-            "FLOAT4" | "FLOAT8" | "NUMERIC" | "MONEY" => {
-                let v: Option<f64> = row.try_get(col.ordinal()).unwrap_or(None);
-                json!(v)
-            }
-            "TIMESTAMP" | "TIMESTAMPTZ" => {
-                if let Ok(v) = row.try_get::<Option<String>, _>(col.ordinal()) {
-                    json!(v)
-                } else if let Ok(v) =
-                    row.try_get::<Option<chrono::NaiveDateTime>, _>(col.ordinal())
-                {
-                    json!(v.map(|d| d.to_string()))
-                } else if let Ok(v) =
-                    row.try_get::<Option<chrono::DateTime<chrono::Utc>>, _>(col.ordinal())
-                {
-                    json!(v.map(|d| d.to_string()))
-                } else {
-                    Value::Null
-                }
-            }
-            "DATE" => {
-                if let Ok(v) = row.try_get::<Option<String>, _>(col.ordinal()) {
-                    json!(v)
-                } else if let Ok(v) = row.try_get::<Option<chrono::NaiveDate>, _>(col.ordinal()) {
-                    json!(v.map(|d| d.to_string()))
-                } else {
-                    Value::Null
-                }
-            }
-            "TIME" | "TIMETZ" => {
-                if let Ok(v) = row.try_get::<Option<String>, _>(col.ordinal()) {
-                    json!(v)
-                } else if let Ok(v) = row.try_get::<Option<chrono::NaiveTime>, _>(col.ordinal()) {
-                    json!(v.map(|d| d.to_string()))
-                } else {
-                    Value::Null
-                }
-            }
-            "JSON" | "JSONB" => {
-                if let Ok(v) = row.try_get::<Option<serde_json::Value>, _>(col.ordinal()) {
-                    json!(v)
-                } else if let Ok(v) = row.try_get::<Option<String>, _>(col.ordinal()) {
-                    json!(v)
-                } else {
-                    Value::Null
-                }
-            }
-            "BYTEA" | "VARBINARY" | "BINARY" | "BLOB" => {
-                match row.try_get::<Option<Vec<u8>>, _>(col.ordinal()) {
-                    Ok(Some(v)) => {
-                        let hex: String =
-                            v.iter().take(32).map(|b| format!("{:02X}", b)).collect();
-                        let suffix = if v.len() > 32 {
-                            format!("... ({} bytes)", v.len())
-                        } else {
-                            String::new()
-                        };
-                        json!(format!("0x{}{}", hex, suffix))
-                    }
-                    Ok(None) => Value::Null,
-                    Err(_) => Value::Null,
-                }
-            }
-            _ => match row.try_get::<Option<String>, _>(col.ordinal()) {
-                Ok(v) => json!(v),
-                Err(_) => match row.try_get::<Option<Vec<u8>>, _>(col.ordinal()) {
-                    Ok(Some(v)) => {
-                        let hex: String =
-                            v.iter().take(16).map(|b| format!("{:02X}", b)).collect();
-                        let suffix = if v.len() > 16 { "..." } else { "" };
-                        json!(format!("[BLOB: 0x{}{}]", hex, suffix))
-                    }
-                    _ => Value::Null,
-                },
-            },
+        let kind = col.type_info().name();
+        if map.contains_key(name) {
+            return Err(format!(
+                "Duplicate result column '{}'; use distinct SQL aliases",
+                name
+            ));
+        }
+        macro_rules! get { ($ty:ty) => { row.try_get::<Option<$ty>, _>(col.ordinal())
+            .map_err(|_| format!("Cannot decode column '{}' ({}) without data loss; cast it explicitly in SQL", name, kind))? }; }
+        let value = match kind {
+            "BOOL" => json!(get!(bool)),
+            "INT2" => get!(i16)
+                .map(|v| exact_integer(v as i128))
+                .unwrap_or(Value::Null),
+            "INT4" => get!(i32)
+                .map(|v| exact_integer(v as i128))
+                .unwrap_or(Value::Null),
+            "INT8" => get!(i64)
+                .map(|v| exact_integer(v as i128))
+                .unwrap_or(Value::Null),
+            "FLOAT4" => get!(f32)
+                .map(|v| finite_float(v as f64))
+                .unwrap_or(Value::Null),
+            "FLOAT8" => get!(f64).map(finite_float).unwrap_or(Value::Null),
+            "NUMERIC" => json!(get!(sqlx::types::BigDecimal).map(|v| v.to_string())),
+            "TIMESTAMP" => json!(get!(chrono::NaiveDateTime).map(|v| v.to_string())),
+            "TIMESTAMPTZ" => json!(get!(chrono::DateTime<chrono::Utc>).map(|v| v.to_rfc3339())),
+            "DATE" => json!(get!(chrono::NaiveDate).map(|v| v.to_string())),
+            "TIME" => json!(get!(chrono::NaiveTime).map(|v| v.to_string())),
+            "JSON" | "JSONB" => json!(get!(Value).map(|v| v.to_string())),
+            "UUID" => json!(get!(uuid::Uuid).map(|v| v.to_string())),
+            "BYTEA" => get!(Vec<u8>).map(hex_bytes).unwrap_or(Value::Null),
+            _ => json!(get!(String)),
         };
-
         map.insert(name.to_string(), value);
     }
-
-    map
+    Ok(map)
 }
 
 async fn execute_query_inner(
@@ -434,14 +267,21 @@ async fn execute_query_inner(
                 .get_mysql_pool(config, config.database.as_deref())
                 .await?;
 
-            let rows = sqlx::query(query)
-                .fetch_all(&pool)
-                .await
-                .map_err(|e| e.to_string())?;
+            let mut connection = pool.acquire().await.map_err(|e| e.to_string())?.detach();
+            let mut rows = sqlx::query(query).fetch(&mut connection);
             let mut results = Vec::new();
-
-            for row in rows {
-                results.push(mysql_row_to_json_map(&row));
+            let mut bytes = 0usize;
+            while let Some(row) = rows.try_next().await.map_err(|e| e.to_string())? {
+                let decoded = mysql_row_to_json_map(&row)?;
+                bytes = bytes.saturating_add(
+                    serde_json::to_vec(&decoded)
+                        .map_err(|e| e.to_string())?
+                        .len(),
+                );
+                if results.len() >= 10_000 || bytes > 32 * 1024 * 1024 {
+                    return Err("Result exceeds 10,000 rows or 32 MiB. Use LIMIT/pagination or native database export; no truncated result is returned".into());
+                }
+                results.push(decoded);
             }
             Ok(results)
         }
@@ -450,37 +290,36 @@ async fn execute_query_inner(
                 .get_pg_pool(config, config.database.as_deref())
                 .await?;
 
-            let rows = sqlx::query(query)
-                .fetch_all(&pool)
-                .await
-                .map_err(|e| e.to_string())?;
+            let mut connection = pool.acquire().await.map_err(|e| e.to_string())?.detach();
+            let mut rows = sqlx::query(query).fetch(&mut connection);
             let mut results = Vec::new();
-
-            for row in rows {
-                results.push(pg_row_to_json_map(&row));
+            let mut bytes = 0usize;
+            while let Some(row) = rows.try_next().await.map_err(|e| e.to_string())? {
+                let decoded = pg_row_to_json_map(&row)?;
+                bytes = bytes.saturating_add(
+                    serde_json::to_vec(&decoded)
+                        .map_err(|e| e.to_string())?
+                        .len(),
+                );
+                if results.len() >= 10_000 || bytes > 32 * 1024 * 1024 {
+                    return Err("Result exceeds 10,000 rows or 32 MiB. Use LIMIT/pagination or native database export; no truncated result is returned".into());
+                }
+                results.push(decoded);
             }
             Ok(results)
         }
         "redis" => {
-            let mut con = pool_manager.get_redis_conn(config).await?;
-
-            if let Some(db) = &config.database {
-                if !db.is_empty() {
-                    let db_part = db.split_whitespace().next().unwrap_or("");
-                    let db_index: i32 = if db_part.is_empty() {
-                        0
-                    } else if let Some(num_str) = db_part.strip_prefix("db") {
-                        num_str.parse().unwrap_or(0)
-                    } else {
-                        db_part.parse().unwrap_or(0)
-                    };
-                    let _: () = redis::cmd("SELECT")
-                        .arg(db_index)
-                        .query_async(&mut con)
-                        .await
-                        .map_err(|e| e.to_string())?;
-                }
+            if query.len() > 1024 * 1024 {
+                return Err("Redis command batch exceeds 1 MiB".into());
             }
+            for line in query
+                .lines()
+                .map(str::trim)
+                .filter(|v| !v.is_empty() && !v.starts_with('#') && !v.starts_with("--"))
+            {
+                redis_support::command_args(line)?;
+            }
+            let mut con = pool_manager.get_redis_conn(config).await?;
 
             let mut results = Vec::new();
 
@@ -502,31 +341,7 @@ async fn execute_query_inner(
                     continue;
                 }
 
-                let mut args = Vec::new();
-                let mut current = String::new();
-                let mut in_quotes = false;
-                let mut escape = false;
-
-                for c in trimmed.chars() {
-                    if escape {
-                        current.push(c);
-                        escape = false;
-                    } else if c == '\\' {
-                        escape = true;
-                    } else if c == '"' {
-                        in_quotes = !in_quotes;
-                    } else if c.is_whitespace() && !in_quotes {
-                        if !current.is_empty() {
-                            args.push(current.clone());
-                            current.clear();
-                        }
-                    } else {
-                        current.push(c);
-                    }
-                }
-                if !current.is_empty() {
-                    args.push(current);
-                }
+                let args = redis_support::command_args(trimmed)?;
 
                 if args.is_empty() {
                     continue;
@@ -633,27 +448,10 @@ async fn test_connection(config: ConnectionConfig) -> Result<String, String> {
             Ok("PostgreSQL 连接成功!".to_string())
         }
         "redis" => {
-            let url = if let Some(pass) = &config.password {
-                format!(
-                    "redis://:{}@{}:{}/{}",
-                    pass,
-                    config.host,
-                    config.port,
-                    config.database.as_deref().unwrap_or("0")
-                )
-            } else {
-                format!(
-                    "redis://{}:{}/{}",
-                    config.host,
-                    config.port,
-                    config.database.as_deref().unwrap_or("0")
-                )
-            };
-
-            let client = redis::Client::open(url).map_err(|e| e.to_string())?;
-            let mut con = client.get_connection().map_err(|e| e.to_string())?;
+            let mut con = redis_support::connect(&config).await?;
             let _: String = redis::cmd("PING")
-                .query(&mut con)
+                .query_async(&mut con)
+                .await
                 .map_err(|e| e.to_string())?;
             Ok("Redis Connection Successful!".to_string())
         }
@@ -673,34 +471,19 @@ fn get_config_path(app_handle: &tauri::AppHandle) -> Result<PathBuf, String> {
 #[tauri::command]
 fn save_connection(app_handle: tauri::AppHandle, config: ConnectionConfig) -> Result<(), String> {
     let path = get_config_path(&app_handle)?;
-    let mut connections = if path.exists() {
-        let content = fs::read_to_string(&path).map_err(|e| e.to_string())?;
-        serde_json::from_str::<Vec<ConnectionConfig>>(&content).unwrap_or_default()
-    } else {
-        Vec::new()
-    };
-
-    // Update if exists, otherwise push
-    if let Some(idx) = connections.iter().position(|c| c.id == config.id) {
-        connections[idx] = config;
-    } else {
-        connections.push(config);
-    }
-
-    let json = serde_json::to_string_pretty(&connections).map_err(|e| e.to_string())?;
-    fs::write(path, json).map_err(|e| e.to_string())?;
-    Ok(())
+    config_store::update::<Vec<ConnectionConfig>, _>(&path, |connections| {
+        if let Some(existing) = connections.iter_mut().find(|c| c.id == config.id) {
+            *existing = config;
+        } else {
+            connections.push(config);
+        }
+        Ok(())
+    })
 }
 
 #[tauri::command]
 fn get_connections(app_handle: tauri::AppHandle) -> Result<Vec<ConnectionConfig>, String> {
-    let path = get_config_path(&app_handle)?;
-    if !path.exists() {
-        return Ok(Vec::new());
-    }
-    let content = fs::read_to_string(&path).map_err(|e| e.to_string())?;
-    let connections = serde_json::from_str(&content).unwrap_or_default();
-    Ok(connections)
+    config_store::read(&get_config_path(&app_handle)?)
 }
 
 #[tauri::command]
@@ -709,22 +492,17 @@ async fn delete_connection(
     app_handle: tauri::AppHandle,
     id: String,
 ) -> Result<(), String> {
-    let path = get_config_path(&app_handle)?;
-    if !path.exists() {
-        return Ok(());
+    let removed = config_store::update::<Vec<ConnectionConfig>, _>(
+        &get_config_path(&app_handle)?,
+        |connections| {
+            let removed = connections.iter().find(|c| c.id == id).cloned();
+            connections.retain(|c| c.id != id);
+            Ok(removed)
+        },
+    )?;
+    if let Some(config) = removed {
+        pool_manager.remove_pool(&config).await;
     }
-    let content = fs::read_to_string(&path).map_err(|e| e.to_string())?;
-    let mut connections: Vec<ConnectionConfig> = serde_json::from_str(&content).unwrap_or_default();
-
-    // Clean up pool for deleted connection
-    if let Some(config) = connections.iter().find(|c| c.id == id) {
-        pool_manager.remove_pool(config).await;
-    }
-
-    connections.retain(|c| c.id != id);
-
-    let json = serde_json::to_string_pretty(&connections).map_err(|e| e.to_string())?;
-    fs::write(path, json).map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -756,19 +534,35 @@ async fn get_databases(
             // Query each one for key count using DBSIZE
             let mut con = pool_manager.get_redis_conn(&config).await?;
 
+            let configured: redis::RedisResult<Vec<String>> = redis::cmd("CONFIG")
+                .arg("GET")
+                .arg("databases")
+                .query_async(&mut con)
+                .await;
+            let count = configured
+                .ok()
+                .and_then(|v| v.get(1)?.parse::<usize>().ok())
+                .unwrap_or(16)
+                .min(1024);
             let mut dbs = Vec::new();
-            for i in 0..16 {
+            for i in 0..count {
                 // Select db
-                let _: () = redis::cmd("SELECT")
-                    .arg(i)
-                    .query_async(&mut con)
-                    .await
-                    .map_err(|e| e.to_string())?;
+                let selected: redis::RedisResult<()> =
+                    redis::cmd("SELECT").arg(i).query_async(&mut con).await;
+                if let Err(error) = selected {
+                    if i > 0
+                        && (error.to_string().contains("out of range")
+                            || error.to_string().contains("cluster mode"))
+                    {
+                        break;
+                    }
+                    return Err(error.to_string());
+                }
                 // Get key count
                 let count: i64 = redis::cmd("DBSIZE")
                     .query_async(&mut con)
                     .await
-                    .unwrap_or(0);
+                    .map_err(|e| e.to_string())?;
                 dbs.push(format!("db{} ({})", i, count));
             }
             Ok(dbs)
@@ -885,31 +679,37 @@ async fn get_tables(
             Ok(tables)
         }
         "redis" => {
-            let mut con = pool_manager.get_redis_conn(&config).await?;
-
-            // Select DB if provided (database param could be "db0 (15)", "db0", "0", or empty)
-            let db_str = database.or(config.database.clone()).unwrap_or_default();
-            // Extract just the db part before any space (for "db0 (15)" -> "db0")
-            let db_part = db_str.split_whitespace().next().unwrap_or("");
-            let db_index: i32 = if db_part.is_empty() {
-                0
-            } else if let Some(num_str) = db_part.strip_prefix("db") {
-                num_str.parse().unwrap_or(0)
-            } else {
-                db_part.parse().unwrap_or(0)
+            let effective = ConnectionConfig {
+                database: database.or(config.database.clone()),
+                ..config
             };
-            let _: () = redis::cmd("SELECT")
-                .arg(db_index)
-                .query_async(&mut con)
-                .await
-                .map_err(|e| e.to_string())?;
-
-            // Get all keys (limited to 1000 for performance)
-            let keys: Vec<String> = redis::cmd("KEYS")
-                .arg("*")
-                .query_async(&mut con)
-                .await
-                .map_err(|e| e.to_string())?;
+            let mut con = pool_manager.get_redis_conn(&effective).await?;
+            // Bounded, incremental discovery; never issue blocking KEYS *.
+            let mut cursor = 0u64;
+            let mut seen = std::collections::HashSet::new();
+            let mut keys = Vec::new();
+            loop {
+                let (next, batch): (u64, Vec<String>) = redis::cmd("SCAN")
+                    .arg(cursor)
+                    .arg("COUNT")
+                    .arg(200)
+                    .query_async(&mut con)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                for key in batch {
+                    if seen.insert(key.clone()) {
+                        keys.push(key);
+                    }
+                    if keys.len() >= 1000 {
+                        break;
+                    }
+                }
+                cursor = next;
+                if cursor == 0 || keys.len() >= 1000 {
+                    break;
+                }
+            }
+            keys.sort();
 
             let tables = keys
                 .into_iter()
@@ -1044,24 +844,16 @@ async fn get_columns(
             let pool = pool_manager.get_pg_pool(&config, target_db).await?;
 
             let query = "
-                SELECT 
-                    c.column_name, 
-                    c.data_type,
-                    CASE WHEN tc.constraint_type = 'PRIMARY KEY' THEN true ELSE false END as is_pk,
-                    c.is_nullable, 
-                    c.column_default,
-                    pg_catalog.col_description(format('%s.%s', c.table_schema, c.table_name)::regclass::oid, c.ordinal_position) as comment
-                FROM information_schema.columns c
-                LEFT JOIN information_schema.key_column_usage kcu 
-                    ON c.table_schema = kcu.table_schema 
-                    AND c.table_name = kcu.table_name 
-                    AND c.column_name = kcu.column_name
-                LEFT JOIN information_schema.table_constraints tc 
-                    ON kcu.constraint_name = tc.constraint_name 
-                    AND kcu.table_schema = tc.table_schema
-                    AND tc.constraint_type = 'PRIMARY KEY'
-                WHERE c.table_schema = 'public' AND c.table_name = $1
-                ORDER BY c.ordinal_position
+                SELECT a.attname::text, pg_catalog.format_type(a.atttypid, a.atttypmod),
+                    EXISTS (SELECT 1 FROM pg_index i WHERE i.indrelid = c.oid AND i.indisprimary AND a.attnum = ANY(i.indkey)),
+                    CASE WHEN a.attnotnull THEN 'NO' ELSE 'YES' END,
+                    pg_get_expr(d.adbin, d.adrelid), pg_catalog.col_description(c.oid, a.attnum)
+                FROM pg_attribute a
+                JOIN pg_class c ON a.attrelid = c.oid
+                JOIN pg_namespace n ON n.oid = c.relnamespace
+                LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum
+                WHERE n.nspname = 'public' AND c.relname = $1 AND a.attnum > 0 AND NOT a.attisdropped
+                ORDER BY a.attnum
             ";
             let rows: Vec<(
                 String,
@@ -1090,31 +882,18 @@ async fn get_columns(
             Ok(result)
         }
         "redis" => {
-            let mut con = pool_manager.get_redis_conn(&config).await?;
-
-            // Select DB
-            if let Some(db) = &database.or(config.database.clone()) {
-                if !db.is_empty() {
-                    let db_part = db.split_whitespace().next().unwrap_or("");
-                    let db_index: i32 = if let Some(num_str) = db_part.strip_prefix("db") {
-                        num_str.parse().unwrap_or(0)
-                    } else {
-                        db_part.parse().unwrap_or(0)
-                    };
-                    let _: () = redis::cmd("SELECT")
-                        .arg(db_index)
-                        .query_async(&mut con)
-                        .await
-                        .map_err(|e| e.to_string())?;
-                }
-            }
+            let effective = ConnectionConfig {
+                database: database.or(config.database.clone()),
+                ..config
+            };
+            let mut con = pool_manager.get_redis_conn(&effective).await?;
 
             // Get key type
             let key_type: String = redis::cmd("TYPE")
                 .arg(&table)
                 .query_async(&mut con)
                 .await
-                .unwrap_or_else(|_| "unknown".to_string());
+                .map_err(|e| e.to_string())?;
 
             // Return a single "column" representing the key type
             Ok(vec![ColumnDef {
@@ -1250,643 +1029,46 @@ async fn export_database_sql(
     output_path: String,
 ) -> Result<(), String> {
     let target_db = resolve_target_database(&config, database.as_deref())?;
-    let cancel_flag = export_task_manager.start_task(&task_id).await;
-    let mut total_tables = 0usize;
-    let mut total_units = 1usize;
-    let mut processed_units = 0usize;
-    let mut processed_tables = 0usize;
-    let mut current_table: Option<String> = None;
-    let mut current_row = 0usize;
-    let mut current_table_rows = 0usize;
-
-    let emit_running = |stage: &str,
-                        table_name: Option<&str>,
-                        processed_rows: usize,
-                        table_rows: usize,
-                        processed_units: usize,
-                        processed_tables: usize,
-                        total_tables: usize,
-                        total_units: usize| {
+    let cancel_flag = export_task_manager.start_task(&task_id).await?;
+    let progress = |status: &str, error: Option<String>| {
         emit_export_progress(
             &app_handle,
             DatabaseExportProgress {
                 task_id: task_id.clone(),
                 database: target_db.clone(),
-                progress: calculate_progress(processed_units, total_units, "running"),
-                status: "running".to_string(),
-                stage: stage.to_string(),
-                table_name: table_name.map(|value| value.to_string()),
-                processed_tables,
-                total_tables,
-                processed_rows,
-                table_rows,
-                error: None,
+                progress: if status == "completed" { 100 } else { 0 },
+                status: status.into(),
+                stage: if status == "running" {
+                    "native_dump".into()
+                } else {
+                    status.into()
+                },
+                table_name: None,
+                processed_tables: 0,
+                total_tables: 0,
+                processed_rows: 0,
+                table_rows: 0,
+                error,
             },
-        );
+        )
     };
-
-    emit_running(
-        "preparing",
-        None,
-        0,
-        0,
-        processed_units,
-        processed_tables,
-        total_tables,
-        total_units,
-    );
-
-    let export_result: Result<(), String> = async {
-        let file = fs::File::create(&output_path).map_err(|e| e.to_string())?;
-        let mut writer = BufWriter::new(file);
-
-        match config.db_type.as_str() {
-            "mysql" => {
-                let pool = pool_manager.get_mysql_pool(&config, Some(&target_db)).await?;
-                let tables: Vec<(String, Option<u64>)> = sqlx::query_as(
-                    "
-                    SELECT TABLE_NAME, TABLE_ROWS
-                    FROM information_schema.TABLES
-                    WHERE TABLE_SCHEMA = ? AND TABLE_TYPE = 'BASE TABLE'
-                    ORDER BY TABLE_NAME
-                    ",
-                )
-                .bind(&target_db)
-                .fetch_all(&pool)
-                .await
-                .map_err(|e| e.to_string())?;
-
-                total_tables = tables.len();
-                total_units = 1 + tables
-                    .iter()
-                    .map(|(_, row_count)| row_count.unwrap_or(0) as usize + 20)
-                    .sum::<usize>();
-                emit_running(
-                    "preparing",
-                    None,
-                    0,
-                    0,
-                    processed_units,
-                    processed_tables,
-                    total_tables,
-                    total_units,
-                );
-
-                writeln!(writer, "-- RECCH database export").map_err(|e| e.to_string())?;
-                writeln!(writer, "-- Database: {}", target_db).map_err(|e| e.to_string())?;
-                writeln!(writer, "SET FOREIGN_KEY_CHECKS=0;").map_err(|e| e.to_string())?;
-                writeln!(writer).map_err(|e| e.to_string())?;
-
-                for (table, estimated_rows) in tables {
-                    ensure_not_cancelled(cancel_flag.as_ref())?;
-                    current_table = Some(table.clone());
-                    current_row = 0;
-                    current_table_rows = estimated_rows.unwrap_or(0) as usize;
-
-                    emit_running(
-                        "schema",
-                        current_table.as_deref(),
-                        current_row,
-                        current_table_rows,
-                        processed_units,
-                        processed_tables,
-                        total_tables,
-                        total_units,
-                    );
-
-                    let quoted_table = quote_mysql_identifier(&table);
-                    let show_create_query = format!("SHOW CREATE TABLE {}", quoted_table);
-                    let create_row = sqlx::query(&show_create_query)
-                        .fetch_one(&pool)
-                        .await
-                        .map_err(|e| e.to_string())?;
-                    let create_stmt: String =
-                        create_row.try_get(1).map_err(|e| e.to_string())?;
-
-                    writeln!(writer, "-- Table: {}", table).map_err(|e| e.to_string())?;
-                    writeln!(writer, "DROP TABLE IF EXISTS {};", quoted_table)
-                        .map_err(|e| e.to_string())?;
-                    writeln!(writer, "{};", create_stmt).map_err(|e| e.to_string())?;
-
-                    processed_units += 10;
-                    emit_running(
-                        "counting",
-                        current_table.as_deref(),
-                        current_row,
-                        current_table_rows,
-                        processed_units,
-                        processed_tables,
-                        total_tables,
-                        total_units,
-                    );
-
-                    let count_query = format!("SELECT COUNT(*) FROM {}", quoted_table);
-                    let count_row = sqlx::query(&count_query)
-                        .fetch_one(&pool)
-                        .await
-                        .map_err(|e| e.to_string())?;
-                    let exact_table_rows = count_row
-                        .try_get::<i64, _>(0)
-                        .map(|value| value.max(0) as usize)
-                        .or_else(|_| count_row.try_get::<u64, _>(0).map(|value| value as usize))
-                        .map_err(|e| e.to_string())?;
-
-                    if exact_table_rows > current_table_rows {
-                        total_units += exact_table_rows - current_table_rows;
-                    } else {
-                        total_units = total_units.saturating_sub(current_table_rows - exact_table_rows);
-                    }
-                    current_table_rows = exact_table_rows;
-
-                    emit_running(
-                        "fetching",
-                        current_table.as_deref(),
-                        current_row,
-                        current_table_rows,
-                        processed_units,
-                        processed_tables,
-                        total_tables,
-                        total_units,
-                    );
-
-                    let columns: Vec<String> = sqlx::query_scalar(
-                        "
-                        SELECT COLUMN_NAME
-                        FROM information_schema.COLUMNS
-                        WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?
-                        ORDER BY ORDINAL_POSITION
-                        ",
-                    )
-                    .bind(&target_db)
-                    .bind(&table)
-                    .fetch_all(&pool)
-                    .await
-                    .map_err(|e| e.to_string())?;
-
-                    let column_sql = columns
-                        .iter()
-                        .map(|column| quote_mysql_identifier(column))
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    let mut actual_rows = 0usize;
-                    let data_query = format!("SELECT * FROM {}", quoted_table);
-                    let mut rows = sqlx::query(&data_query).fetch(&pool);
-
-                    while let Some(row) = rows.try_next().await.map_err(|e| e.to_string())? {
-                        ensure_not_cancelled(cancel_flag.as_ref())?;
-
-                        let row_map = mysql_row_to_json_map(&row);
-                        let values = columns
-                            .iter()
-                            .map(|column| sql_literal(row_map.get(column), "mysql"))
-                            .collect::<Vec<_>>()
-                            .join(", ");
-                        writeln!(
-                            writer,
-                            "INSERT INTO {} ({}) VALUES ({});",
-                            quoted_table, column_sql, values
-                        )
-                        .map_err(|e| e.to_string())?;
-
-                        processed_units += 1;
-                        current_row += 1;
-                        actual_rows += 1;
-                        if current_row > current_table_rows {
-                            total_units += current_row - current_table_rows;
-                            current_table_rows = current_row;
-                        }
-                        if current_row % 100 == 0 || current_row == current_table_rows {
-                            emit_running(
-                                "data",
-                                current_table.as_deref(),
-                                current_row,
-                                current_table_rows,
-                                processed_units,
-                                processed_tables,
-                                total_tables,
-                                total_units,
-                            );
-                        }
-                    }
-
-                    let row_units = current_table_rows.max(actual_rows);
-                    if row_units > actual_rows {
-                        processed_units += row_units - actual_rows;
-                        current_table_rows = actual_rows;
-                    }
-
-                    writeln!(writer).map_err(|e| e.to_string())?;
-                    processed_units += 10;
-                    processed_tables += 1;
-                    current_row = current_table_rows;
-                    emit_running(
-                        "table_complete",
-                        current_table.as_deref(),
-                        current_row,
-                        current_table_rows,
-                        processed_units,
-                        processed_tables,
-                        total_tables,
-                        total_units,
-                    );
-                }
-
-                writeln!(writer, "SET FOREIGN_KEY_CHECKS=1;").map_err(|e| e.to_string())?;
-                writer.flush().map_err(|e| e.to_string())?;
-                Ok(())
-            }
-            "postgresql" => {
-                let pool = pool_manager.get_pg_pool(&config, Some(&target_db)).await?;
-                let tables: Vec<(String, Option<i64>)> = sqlx::query_as(
-                    "
-                    SELECT c.relname AS table_name, CAST(c.reltuples AS BIGINT) AS row_count
-                    FROM pg_class c
-                    JOIN pg_namespace n ON n.oid = c.relnamespace
-                    WHERE n.nspname = 'public' AND c.relkind = 'r'
-                    ORDER BY c.relname
-                    ",
-                )
-                .fetch_all(&pool)
-                .await
-                .map_err(|e| e.to_string())?;
-
-                total_tables = tables.len();
-                total_units = 1 + tables
-                    .iter()
-                    .map(|(_, row_count)| row_count.unwrap_or(0).max(0) as usize + 20)
-                    .sum::<usize>();
-                emit_running(
-                    "preparing",
-                    None,
-                    0,
-                    0,
-                    processed_units,
-                    processed_tables,
-                    total_tables,
-                    total_units,
-                );
-
-                let public_schema = quote_pg_identifier("public");
-
-                writeln!(writer, "-- RECCH database export").map_err(|e| e.to_string())?;
-                writeln!(writer, "-- Database: {}", target_db).map_err(|e| e.to_string())?;
-                writeln!(writer, "BEGIN;").map_err(|e| e.to_string())?;
-                writeln!(writer).map_err(|e| e.to_string())?;
-
-                for (table, estimated_rows) in tables {
-                    ensure_not_cancelled(cancel_flag.as_ref())?;
-                    current_table = Some(table.clone());
-                    current_row = 0;
-                    current_table_rows = estimated_rows.unwrap_or(0).max(0) as usize;
-
-                    emit_running(
-                        "schema",
-                        current_table.as_deref(),
-                        current_row,
-                        current_table_rows,
-                        processed_units,
-                        processed_tables,
-                        total_tables,
-                        total_units,
-                    );
-
-                    let quoted_table = quote_pg_identifier(&table);
-                    let full_table_name = format!("{}.{}", public_schema, quoted_table);
-
-                    let columns: Vec<(String, String, bool, Option<String>, Option<String>)> =
-                        sqlx::query_as(
-                            "
-                            SELECT
-                                a.attname AS column_name,
-                                pg_catalog.format_type(a.atttypid, a.atttypmod) AS data_type,
-                                NOT a.attnotnull AS is_nullable,
-                                pg_get_expr(ad.adbin, ad.adrelid) AS column_default,
-                                pg_catalog.col_description(a.attrelid, a.attnum) AS comment
-                            FROM pg_attribute a
-                            JOIN pg_class c ON a.attrelid = c.oid
-                            JOIN pg_namespace n ON c.relnamespace = n.oid
-                            LEFT JOIN pg_attrdef ad ON a.attrelid = ad.adrelid AND a.attnum = ad.adnum
-                            WHERE n.nspname = 'public'
-                              AND c.relname = $1
-                              AND a.attnum > 0
-                              AND NOT a.attisdropped
-                            ORDER BY a.attnum
-                            ",
-                        )
-                        .bind(&table)
-                        .fetch_all(&pool)
-                        .await
-                        .map_err(|e| e.to_string())?;
-
-                    let primary_key_columns: Vec<String> = sqlx::query_scalar(
-                        "
-                        SELECT a.attname
-                        FROM pg_index i
-                        JOIN pg_class c ON c.oid = i.indrelid
-                        JOIN pg_namespace n ON n.oid = c.relnamespace
-                        JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum = ANY(i.indkey)
-                        WHERE n.nspname = 'public'
-                          AND c.relname = $1
-                          AND i.indisprimary
-                        ORDER BY array_position(i.indkey, a.attnum)
-                        ",
-                    )
-                    .bind(&table)
-                    .fetch_all(&pool)
-                    .await
-                    .map_err(|e| e.to_string())?;
-
-                    let table_comment: Option<String> = sqlx::query_scalar(
-                        "
-                        SELECT obj_description(c.oid, 'pg_class')
-                        FROM pg_class c
-                        JOIN pg_namespace n ON n.oid = c.relnamespace
-                        WHERE n.nspname = 'public' AND c.relname = $1
-                        ",
-                    )
-                    .bind(&table)
-                    .fetch_one(&pool)
-                    .await
-                    .map_err(|e| e.to_string())?;
-
-                    let index_statements: Vec<String> = sqlx::query_scalar(
-                        "
-                        SELECT indexdef
-                        FROM pg_indexes
-                        WHERE schemaname = 'public'
-                          AND tablename = $1
-                          AND indexname NOT LIKE '%_pkey'
-                        ORDER BY indexname
-                        ",
-                    )
-                    .bind(&table)
-                    .fetch_all(&pool)
-                    .await
-                    .map_err(|e| e.to_string())?;
-
-                    let foreign_keys: Vec<(String, String)> = sqlx::query_as(
-                        "
-                        SELECT conname, pg_get_constraintdef(oid)
-                        FROM pg_constraint
-                        WHERE conrelid = format('public.%I', $1)::regclass
-                          AND contype = 'f'
-                        ORDER BY conname
-                        ",
-                    )
-                    .bind(&table)
-                    .fetch_all(&pool)
-                    .await
-                    .map_err(|e| e.to_string())?;
-
-                    let mut create_lines = Vec::new();
-                    let mut ordered_columns = Vec::new();
-                    let mut serial_columns = Vec::new();
-
-                    for (name, data_type, is_nullable, default_value, _) in &columns {
-                        ordered_columns.push(name.clone());
-
-                        let (normalized_type, normalized_default, is_serial) =
-                            normalize_pg_column_definition(data_type, default_value.as_deref());
-                        if is_serial {
-                            serial_columns.push(name.clone());
-                        }
-
-                        let mut line =
-                            format!("{} {}", quote_pg_identifier(name), normalized_type);
-                        if let Some(default_sql) = normalized_default {
-                            line.push_str(&format!(" DEFAULT {}", default_sql));
-                        }
-                        if !is_nullable {
-                            line.push_str(" NOT NULL");
-                        }
-                        create_lines.push(line);
-                    }
-
-                    if !primary_key_columns.is_empty() {
-                        let pk_sql = primary_key_columns
-                            .iter()
-                            .map(|column| quote_pg_identifier(column))
-                            .collect::<Vec<_>>()
-                            .join(", ");
-                        create_lines.push(format!("PRIMARY KEY ({})", pk_sql));
-                    }
-
-                    writeln!(writer, "-- Table: {}", table).map_err(|e| e.to_string())?;
-                    writeln!(writer, "DROP TABLE IF EXISTS {} CASCADE;", full_table_name)
-                        .map_err(|e| e.to_string())?;
-                    writeln!(
-                        writer,
-                        "CREATE TABLE {} (\n    {}\n);",
-                        full_table_name,
-                        create_lines.join(",\n    ")
-                    )
-                    .map_err(|e| e.to_string())?;
-
-                    if let Some(comment) = table_comment {
-                        if !comment.is_empty() {
-                            writeln!(
-                                writer,
-                                "COMMENT ON TABLE {} IS '{}';",
-                                full_table_name,
-                                escape_sql_string(&comment, "postgresql")
-                            )
-                            .map_err(|e| e.to_string())?;
-                        }
-                    }
-
-                    for (name, _, _, _, comment) in &columns {
-                        if let Some(comment) = comment {
-                            if !comment.is_empty() {
-                                writeln!(
-                                    writer,
-                                    "COMMENT ON COLUMN {}.{} IS '{}';",
-                                    full_table_name,
-                                    quote_pg_identifier(name),
-                                    escape_sql_string(comment, "postgresql")
-                                )
-                                .map_err(|e| e.to_string())?;
-                            }
-                        }
-                    }
-
-                    processed_units += 10;
-                    emit_running(
-                        "counting",
-                        current_table.as_deref(),
-                        current_row,
-                        current_table_rows,
-                        processed_units,
-                        processed_tables,
-                        total_tables,
-                        total_units,
-                    );
-
-                    let count_query = format!("SELECT COUNT(*) FROM {}", full_table_name);
-                    let exact_table_rows: i64 = sqlx::query_scalar(&count_query)
-                        .fetch_one(&pool)
-                        .await
-                        .map_err(|e| e.to_string())?;
-
-                    let exact_table_rows = exact_table_rows.max(0) as usize;
-                    if exact_table_rows > current_table_rows {
-                        total_units += exact_table_rows - current_table_rows;
-                    } else {
-                        total_units = total_units.saturating_sub(current_table_rows - exact_table_rows);
-                    }
-                    current_table_rows = exact_table_rows;
-
-                    emit_running(
-                        "fetching",
-                        current_table.as_deref(),
-                        current_row,
-                        current_table_rows,
-                        processed_units,
-                        processed_tables,
-                        total_tables,
-                        total_units,
-                    );
-
-                    let column_sql = ordered_columns
-                        .iter()
-                        .map(|column| quote_pg_identifier(column))
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    let mut actual_rows = 0usize;
-                    let data_query = format!("SELECT * FROM {}", full_table_name);
-                    let mut rows = sqlx::query(&data_query).fetch(&pool);
-
-                    while let Some(row) = rows.try_next().await.map_err(|e| e.to_string())? {
-                        ensure_not_cancelled(cancel_flag.as_ref())?;
-
-                        let row_map = pg_row_to_json_map(&row);
-                        let values = ordered_columns
-                            .iter()
-                            .map(|column| sql_literal(row_map.get(column), "postgresql"))
-                            .collect::<Vec<_>>()
-                            .join(", ");
-                        writeln!(
-                            writer,
-                            "INSERT INTO {} ({}) VALUES ({});",
-                            full_table_name, column_sql, values
-                        )
-                        .map_err(|e| e.to_string())?;
-
-                        processed_units += 1;
-                        current_row += 1;
-                        actual_rows += 1;
-                        if current_row > current_table_rows {
-                            total_units += current_row - current_table_rows;
-                            current_table_rows = current_row;
-                        }
-                        if current_row % 100 == 0 || current_row == current_table_rows {
-                            emit_running(
-                                "data",
-                                current_table.as_deref(),
-                                current_row,
-                                current_table_rows,
-                                processed_units,
-                                processed_tables,
-                                total_tables,
-                                total_units,
-                            );
-                        }
-                    }
-
-                    let row_units = current_table_rows.max(actual_rows);
-                    if row_units > actual_rows {
-                        processed_units += row_units - actual_rows;
-                        current_table_rows = actual_rows;
-                    }
-
-                    for serial_column in serial_columns {
-                        let relation_name = format!("{}.{}", public_schema, quoted_table);
-                        let column_ident = quote_pg_identifier(&serial_column);
-                        writeln!(
-                            writer,
-                            "SELECT setval(pg_get_serial_sequence('{}', '{}'), COALESCE((SELECT MAX({}) FROM {}), 1), COALESCE((SELECT MAX({}) IS NOT NULL FROM {}), false));",
-                            escape_sql_string(&relation_name, "postgresql"),
-                            escape_sql_string(&serial_column, "postgresql"),
-                            column_ident,
-                            full_table_name,
-                            column_ident,
-                            full_table_name
-                        )
-                        .map_err(|e| e.to_string())?;
-                    }
-
-                    for indexdef in index_statements {
-                        writeln!(writer, "{};", indexdef).map_err(|e| e.to_string())?;
-                    }
-
-                    for (constraint_name, constraint_def) in foreign_keys {
-                        writeln!(
-                            writer,
-                            "ALTER TABLE ONLY {} ADD CONSTRAINT {} {};",
-                            full_table_name,
-                            quote_pg_identifier(&constraint_name),
-                            constraint_def
-                        )
-                        .map_err(|e| e.to_string())?;
-                    }
-
-                    writeln!(writer).map_err(|e| e.to_string())?;
-                    processed_units += 10;
-                    processed_tables += 1;
-                    current_row = current_table_rows;
-                    emit_running(
-                        "table_complete",
-                        current_table.as_deref(),
-                        current_row,
-                        current_table_rows,
-                        processed_units,
-                        processed_tables,
-                        total_tables,
-                        total_units,
-                    );
-                }
-
-                writeln!(writer, "COMMIT;").map_err(|e| e.to_string())?;
-                writer.flush().map_err(|e| e.to_string())?;
-                Ok(())
-            }
-            _ => Err("Database export is only supported for MySQL and PostgreSQL".to_string()),
+    progress("running", None);
+    let result = async {
+        if config.db_type == "mysql" {
+            let pool = pool_manager.get_mysql_pool(&config, Some(&target_db)).await?;
+            let unsafe_tables: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA = ? AND TABLE_TYPE = 'BASE TABLE' AND ENGINE <> 'InnoDB'")
+                .bind(&target_db).fetch_one(&pool).await.map_err(|e| e.to_string())?;
+            if unsafe_tables > 0 { return Err("Consistent export requires InnoDB tables. Use a DBA-managed backup for non-transactional tables.".into()); }
         }
-    }
-    .await;
-
+        native_backup::export(&config, &target_db, std::path::Path::new(&output_path), &cancel_flag).await
+    }.await;
     export_task_manager.remove_task(&task_id).await;
-
-    let status = match &export_result {
-        Ok(_) => "completed",
-        Err(err) if err == "Export cancelled" => "cancelled",
-        Err(_) => "error",
-    };
-
-    if export_result.is_err() {
-        let _ = fs::remove_file(&output_path);
+    match &result {
+        Ok(()) => progress("completed", None),
+        Err(error) if error == "Export cancelled" => progress("cancelled", None),
+        Err(error) => progress("error", Some(error.clone())),
     }
-
-    emit_export_progress(
-        &app_handle,
-        DatabaseExportProgress {
-            task_id,
-            database: target_db,
-            progress: calculate_progress(processed_units, total_units, status),
-            status: status.to_string(),
-            stage: status.to_string(),
-            table_name: current_table,
-            processed_tables,
-            total_tables,
-            processed_rows: current_row,
-            table_rows: current_table_rows,
-            error: export_result
-                .as_ref()
-                .err()
-                .and_then(|err| if status == "error" { Some(err.clone()) } else { None }),
-        },
-    );
-
-    export_result
+    result
 }
 
 #[tauri::command]
@@ -1908,17 +1090,42 @@ async fn import_database_sql(
     database: Option<String>,
     script: String,
 ) -> Result<u64, String> {
+    if script.len() > 64 * 1024 * 1024 {
+        return Err(
+            "SQL script exceeds 64 MiB; use the native database client for large restores".into(),
+        );
+    }
     let target_db = resolve_target_database(&config, database.as_deref())?;
 
     match config.db_type.as_str() {
         "mysql" => {
-            let pool = pool_manager.get_mysql_pool(&config, Some(&target_db)).await?;
-            let result = raw_sql(&script).execute(&pool).await.map_err(|e| e.to_string())?;
+            let pool = pool_manager
+                .get_mysql_pool(&config, Some(&target_db))
+                .await?;
+            let mut connection = pool.acquire().await.map_err(|e| e.to_string())?.detach();
+            let script = native_backup::sql_without_psql_wrapper(&script);
+            let result = sqlx::Executor::execute(&mut connection, script.as_str())
+                .await
+                .map_err(|e| {
+                    format!(
+                        "Import failed; some statements may already be committed: {}",
+                        e
+                    )
+                })?;
             Ok(result.rows_affected())
         }
         "postgresql" => {
             let pool = pool_manager.get_pg_pool(&config, Some(&target_db)).await?;
-            let result = raw_sql(&script).execute(&pool).await.map_err(|e| e.to_string())?;
+            let mut connection = pool.acquire().await.map_err(|e| e.to_string())?.detach();
+            let script = native_backup::sql_without_psql_wrapper(&script);
+            let result = sqlx::Executor::execute(&mut connection, script.as_str())
+                .await
+                .map_err(|e| {
+                    format!(
+                        "Import failed; some statements may already be committed: {}",
+                        e
+                    )
+                })?;
             Ok(result.rows_affected())
         }
         _ => Err("Database import is only supported for MySQL and PostgreSQL".to_string()),
@@ -1934,204 +1141,149 @@ async fn alter_table(
     table: String,
     operation: AlterOperation,
 ) -> Result<(), String> {
-    let query = match config.db_type.as_str() {
-        "mysql" => {
-            match operation.op_type.as_str() {
-                "add" => {
-                    let col = operation
-                        .column_def
-                        .as_ref()
-                        .ok_or("Missing column definition")?;
-                    let comment = col
-                        .comment
-                        .as_ref()
-                        .map(|c| format!("COMMENT '{}'", c.replace("'", "''")))
-                        .unwrap_or_default();
-                    let null_def = if col.is_nullable == Some(false) {
-                        "NOT NULL"
-                    } else {
-                        "NULL"
-                    };
-                    let default_def = col
-                        .default_value
-                        .as_ref()
-                        .map(|d| format!("DEFAULT {}", d))
-                        .unwrap_or_default();
-                    let pk_def = if col.is_pk { "PRIMARY KEY" } else { "" };
-
-                    format!(
-                        "ALTER TABLE {} ADD COLUMN {} {} {} {} {} {}",
-                        table, col.name, col.type_name, null_def, default_def, pk_def, comment
-                    )
-                }
-                "modify" => {
-                    let col = operation
-                        .column_def
-                        .as_ref()
-                        .ok_or("Missing column definition")?;
-                    let comment = col
-                        .comment
-                        .as_ref()
-                        .map(|c| format!("COMMENT '{}'", c.replace("'", "''")))
-                        .unwrap_or_default();
-                    let null_def = if col.is_nullable == Some(false) {
-                        "NOT NULL"
-                    } else {
-                        "NULL"
-                    };
-                    let default_def = col
-                        .default_value
-                        .as_ref()
-                        .map(|d| format!("DEFAULT {}", d))
-                        .unwrap_or_default();
-
-                    format!(
-                        "ALTER TABLE {} MODIFY COLUMN {} {} {} {} {}",
-                        table, col.name, col.type_name, null_def, default_def, comment
-                    )
-                }
-                "drop" => {
-                    let col_name = operation
-                        .column_name
-                        .as_ref()
-                        .ok_or("Missing column name")?;
-                    format!("ALTER TABLE {} DROP COLUMN {}", table, col_name)
-                }
-                "rename" => {
-                    // MySQL RENAME COLUMN old TO new
-                    let col_name = operation
-                        .column_name
-                        .as_ref()
-                        .ok_or("Missing column name")?;
-                    let new_name = operation.new_name.as_ref().ok_or("Missing new name")?;
-                    format!(
-                        "ALTER TABLE {} RENAME COLUMN {} TO {}",
-                        table, col_name, new_name
-                    )
-                }
-                "add_index" => {
-                    let idx = operation
-                        .index_def
-                        .as_ref()
-                        .ok_or("Missing index definition")?;
-                    let cols = idx.columns.join(", ");
-                    let unique = if idx.is_unique { "UNIQUE" } else { "" };
-                    format!(
-                        "CREATE {} INDEX {} ON {} ({})",
-                        unique, idx.name, table, cols
-                    )
-                }
-                "drop_index" => {
-                    let idx_name = operation.index_name.as_ref().ok_or("Missing index name")?;
-                    format!("DROP INDEX {} ON {}", idx_name, table)
-                }
-                _ => return Err("Unknown operation".to_string()),
-            }
-        }
-        "postgresql" => {
-            match operation.op_type.as_str() {
-                "add" => {
-                    let col = operation
-                        .column_def
-                        .as_ref()
-                        .ok_or("Missing column definition")?;
-                    // PG doesn't support comment in ADD COLUMN syntax directly usually, need separate COMMENT ON
-                    // But for simplicity here, we might just add column first. Detailed comment support needs multiple queries or a transaction.
-                    // For now: ALTER TABLE ... ADD COLUMN ...
-                    format!(
-                        "ALTER TABLE {} ADD COLUMN {} {}",
-                        table, col.name, col.type_name
-                    )
-                }
-                "modify" => {
-                    let col = operation
-                        .column_def
-                        .as_ref()
-                        .ok_or("Missing column definition")?;
-                    // PG: ALTER TABLE ... ALTER COLUMN ... TYPE ...
-                    format!(
-                        "ALTER TABLE {} ALTER COLUMN {} TYPE {}",
-                        table, col.name, col.type_name
-                    )
-                }
-                "drop" => {
-                    let col_name = operation
-                        .column_name
-                        .as_ref()
-                        .ok_or("Missing column name")?;
-                    format!("ALTER TABLE {} DROP COLUMN {}", table, col_name)
-                }
-                "rename" => {
-                    let col_name = operation
-                        .column_name
-                        .as_ref()
-                        .ok_or("Missing column name")?;
-                    let new_name = operation.new_name.as_ref().ok_or("Missing new name")?;
-                    format!(
-                        "ALTER TABLE {} RENAME COLUMN {} TO {}",
-                        table, col_name, new_name
-                    )
-                }
-                "add_index" => {
-                    let idx = operation
-                        .index_def
-                        .as_ref()
-                        .ok_or("Missing index definition")?;
-                    let cols = idx.columns.join(", ");
-                    let unique = if idx.is_unique { "UNIQUE" } else { "" };
-                    format!(
-                        "CREATE {} INDEX {} ON {} ({})",
-                        unique, idx.name, table, cols
-                    )
-                }
-                "drop_index" => {
-                    let idx_name = operation.index_name.as_ref().ok_or("Missing index name")?;
-                    format!("DROP INDEX {}", idx_name)
-                }
-                _ => return Err("Unknown operation".to_string()),
-            }
-        }
-        _ => return Err("Unsupported database".to_string()),
-    };
-
     match config.db_type.as_str() {
         "mysql" => {
             let pool = pool_manager
                 .get_mysql_pool(&config, config.database.as_deref())
                 .await?;
-            sqlx::query(&query)
-                .execute(&pool)
+            let mut connection = pool.acquire().await.map_err(|e| e.to_string())?.detach();
+            let mode: String = sqlx::query_scalar("SELECT @@SESSION.sql_mode")
+                .fetch_one(&mut connection)
                 .await
                 .map_err(|e| e.to_string())?;
-        }
-        "postgresql" => {
-            let pool = pool_manager
-                .get_pg_pool(&config, config.database.as_deref())
-                .await?;
-            sqlx::query(&query)
-                .execute(&pool)
-                .await
-                .map_err(|e| e.to_string())?;
-
-            // Handle comment for PG separately if it's ADD
-            if operation.op_type == "add" && config.db_type == "postgresql" {
-                if let Some(col) = operation.column_def.as_ref() {
-                    if let Some(comment) = &col.comment {
-                        let comment_query = format!(
-                            "COMMENT ON COLUMN {}.{} IS '{}'",
-                            table,
-                            col.name,
-                            comment.replace("'", "''")
-                        );
-                        let _ = sqlx::query(&comment_query).execute(&pool).await;
+            let mut attributes = String::new();
+            if operation.op_type == "modify" {
+                let col = operation
+                    .column_def
+                    .as_ref()
+                    .ok_or("Missing column definition")?;
+                let name = operation.column_name.as_deref().unwrap_or(&col.name);
+                let (extra, generated, collation): (String, String, Option<String>) = sqlx::query_as("SELECT EXTRA, GENERATION_EXPRESSION, COLLATION_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=? AND COLUMN_NAME=?")
+                    .bind(&table).bind(name).fetch_one(&mut connection).await.map_err(|e| e.to_string())?;
+                if !generated.is_empty()
+                    || (!extra.is_empty() && !extra.eq_ignore_ascii_case("auto_increment"))
+                {
+                    return Err("This column has generated, automatic-update or other special attributes. Use reviewed SQL; visual editing will not silently discard them".into());
+                }
+                if extra.eq_ignore_ascii_case("auto_increment") {
+                    attributes.push_str("AUTO_INCREMENT ");
+                }
+                if let Some(collation) = collation {
+                    if col.type_name.to_ascii_uppercase().contains("CHAR")
+                        || col.type_name.to_ascii_uppercase().contains("TEXT")
+                    {
+                        if !collation
+                            .bytes()
+                            .all(|c| c.is_ascii_alphanumeric() || c == b'_')
+                        {
+                            return Err("Unsupported collation".into());
+                        }
+                        attributes.push_str(&format!("COLLATE {} ", collation));
                     }
                 }
             }
+            for query in schema::queries(
+                &table,
+                &operation,
+                true,
+                !mode.split(',').any(|v| v == "NO_BACKSLASH_ESCAPES"),
+                &attributes,
+            )? {
+                sqlx::query(&query)
+                    .execute(&mut connection)
+                    .await
+                    .map_err(|e| e.to_string())?;
+            }
         }
-        _ => {}
+        "postgresql" => {
+            let queries = schema::queries(&table, &operation, false, true, "")?;
+            let pool = pool_manager
+                .get_pg_pool(&config, config.database.as_deref())
+                .await?;
+            let mut transaction = pool.begin().await.map_err(|e| e.to_string())?;
+            for query in queries {
+                sqlx::query(&query)
+                    .execute(&mut *transaction)
+                    .await
+                    .map_err(|e| e.to_string())?;
+            }
+            transaction.commit().await.map_err(|e| e.to_string())?;
+        }
+        _ => return Err("Unsupported database for schema editing".into()),
     }
-
     Ok(())
+}
+
+async fn import_table_rows_inner(
+    pool_manager: &PoolManager,
+    config: &ConnectionConfig,
+    table: &str,
+    queries: &[String],
+) -> Result<usize, String> {
+    if table.is_empty()
+        || table.contains('\0')
+        || queries.len() > 10_000
+        || queries.iter().map(String::len).sum::<usize>() > 16 * 1024 * 1024
+    {
+        return Err("Invalid table or import exceeds 10,000 rows / 16 MiB; use native tools for large imports".into());
+    }
+    let prefix = format!(
+        "INSERT INTO {} ",
+        match config.db_type.as_str() {
+            "mysql" => quote_mysql_identifier(table),
+            "postgresql" => quote_pg_identifier(table),
+            _ => return Err("Unsupported import database".into()),
+        }
+    );
+    if queries.iter().any(|q| !q.starts_with(&prefix)) {
+        return Err("Table import accepts only INSERT statements for the selected table".into());
+    }
+    macro_rules! insert_all {
+        ($transaction:ident) => {{
+            for query in queries {
+                if let Err(error) = sqlx::query(query).execute(&mut *$transaction).await {
+                    return match $transaction.rollback().await {
+                        Ok(_) => Err(format!("Import transaction rolled back: {}", error)),
+                        Err(_) => Err("Import failed and rollback could not be confirmed; inspect the database before retrying".into()),
+                    };
+                }
+            }
+            $transaction.commit().await.map_err(|_| "Import commit outcome is unknown; inspect the database before retrying".to_string())?;
+        }};
+    }
+    match config.db_type.as_str() {
+        "mysql" => {
+            let pool = pool_manager
+                .get_mysql_pool(config, config.database.as_deref())
+                .await?;
+            let engine: Option<String> = sqlx::query_scalar("SELECT ENGINE FROM information_schema.TABLES WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=?")
+                .bind(table).fetch_optional(&pool).await.map_err(|e| e.to_string())?.flatten();
+            if !engine.is_some_and(|e| e.eq_ignore_ascii_case("InnoDB")) {
+                return Err("Transactional table import requires an InnoDB base table".into());
+            }
+            let mut transaction = pool.begin().await.map_err(|e| e.to_string())?;
+            insert_all!(transaction);
+        }
+        "postgresql" => {
+            let pool = pool_manager
+                .get_pg_pool(config, config.database.as_deref())
+                .await?;
+            let mut transaction = pool.begin().await.map_err(|e| e.to_string())?;
+            insert_all!(transaction);
+        }
+        _ => unreachable!(),
+    }
+    Ok(queries.len())
+}
+
+#[tauri::command]
+async fn import_table_rows(
+    pool_manager: tauri::State<'_, PoolManager>,
+    config: ConnectionConfig,
+    table: String,
+    queries: Vec<String>,
+) -> Result<usize, String> {
+    import_table_rows_inner(pool_manager.inner(), &config, &table, &queries).await
 }
 
 #[tauri::command]
@@ -2150,13 +1302,7 @@ async fn get_ai_config(app: tauri::AppHandle) -> Result<ai_service::AIConfig, St
     let config_dir = app.path().app_config_dir().map_err(|e| e.to_string())?;
     let config_path = config_dir.join("ai_config.json");
 
-    if config_path.exists() {
-        let content = fs::read_to_string(&config_path).map_err(|e| e.to_string())?;
-        let config: ai_service::AIConfig = serde_json::from_str(&content).unwrap_or_default();
-        Ok(config)
-    } else {
-        Ok(ai_service::AIConfig::default())
-    }
+    config_store::read(&config_path)
 }
 
 #[tauri::command]
@@ -2165,9 +1311,7 @@ async fn save_ai_config(app: tauri::AppHandle, config: ai_service::AIConfig) -> 
     fs::create_dir_all(&config_dir).map_err(|e| e.to_string())?;
     let config_path = config_dir.join("ai_config.json");
 
-    let content = serde_json::to_string_pretty(&config).map_err(|e| e.to_string())?;
-    fs::write(&config_path, content).map_err(|e| e.to_string())?;
-    Ok(())
+    config_store::save(&config_path, config)
 }
 
 #[tauri::command]
@@ -2176,8 +1320,16 @@ async fn generate_sql_from_text(
     db_type: String,
     table_schemas: String,
     user_request: String,
+    consent: bool,
+    expected_api_url: String,
 ) -> Result<String, String> {
+    if !consent {
+        return Err("AI transmission requires explicit consent".into());
+    }
     let config = get_ai_config(app).await?;
+    if config.api_url != expected_api_url {
+        return Err("AI endpoint changed; reopen the AI dialog and review the destination".into());
+    }
 
     ai_service::generate_sql(
         &config.api_key,
@@ -2208,23 +1360,11 @@ async fn get_redis_key_value(
     key: String,
     database: Option<String>,
 ) -> Result<RedisKeyInfo, String> {
-    let mut con = pool_manager.get_redis_conn(&config).await?;
-
-    // Select DB
-    let db_str = database.or(config.database).unwrap_or_default();
-    let db_part = db_str.split_whitespace().next().unwrap_or("");
-    let db_index: i32 = if db_part.is_empty() {
-        0
-    } else if let Some(num_str) = db_part.strip_prefix("db") {
-        num_str.parse().unwrap_or(0)
-    } else {
-        db_part.parse().unwrap_or(0)
+    let effective = ConnectionConfig {
+        database: database.or(config.database.clone()),
+        ..config
     };
-    let _: () = redis::cmd("SELECT")
-        .arg(db_index)
-        .query_async(&mut con)
-        .await
-        .map_err(|e| e.to_string())?;
+    let mut con = pool_manager.get_redis_conn(&effective).await?;
 
     // Get key type
     let key_type: String = redis::cmd("TYPE")
@@ -2238,33 +1378,41 @@ async fn get_redis_key_value(
         .arg(&key)
         .query_async(&mut con)
         .await
-        .unwrap_or(-1);
+        .map_err(|e| e.to_string())?;
 
     // Get value based on type
     let (value, length) = match key_type.as_str() {
         "string" => {
-            let v: String = redis::cmd("GET")
+            let len: i64 = redis::cmd("STRLEN")
                 .arg(&key)
                 .query_async(&mut con)
                 .await
-                .unwrap_or_default();
-            (v, None)
+                .map_err(|e| e.to_string())?;
+            let v: String = redis::cmd("GETRANGE")
+                .arg(&key)
+                .arg(0)
+                .arg(65535)
+                .query_async(&mut con)
+                .await
+                .map_err(|e| e.to_string())?;
+            (v, Some(len))
         }
         "list" => {
             let len: i64 = redis::cmd("LLEN")
                 .arg(&key)
                 .query_async(&mut con)
                 .await
-                .unwrap_or(0);
+                .map_err(|e| e.to_string())?;
             let items: Vec<String> = redis::cmd("LRANGE")
                 .arg(&key)
                 .arg(0)
                 .arg(99)
                 .query_async(&mut con)
                 .await
-                .unwrap_or_default();
+                .map_err(|e| e.to_string())?;
             (
-                serde_json::to_string_pretty(&items).unwrap_or_default(),
+                serde_json::to_string_pretty(&items.into_iter().take(100).collect::<Vec<_>>())
+                    .map_err(|e| e.to_string())?,
                 Some(len),
             )
         }
@@ -2273,14 +1421,18 @@ async fn get_redis_key_value(
                 .arg(&key)
                 .query_async(&mut con)
                 .await
-                .unwrap_or(0);
-            let items: Vec<String> = redis::cmd("SMEMBERS")
+                .map_err(|e| e.to_string())?;
+            let (_, mut items): (u64, Vec<String>) = redis::cmd("SSCAN")
                 .arg(&key)
+                .arg(0)
+                .arg("COUNT")
+                .arg(100)
                 .query_async(&mut con)
                 .await
-                .unwrap_or_default();
+                .map_err(|e| e.to_string())?;
+            items.truncate(100);
             (
-                serde_json::to_string_pretty(&items).unwrap_or_default(),
+                serde_json::to_string_pretty(&items).map_err(|e| e.to_string())?,
                 Some(len),
             )
         }
@@ -2289,7 +1441,7 @@ async fn get_redis_key_value(
                 .arg(&key)
                 .query_async(&mut con)
                 .await
-                .unwrap_or(0);
+                .map_err(|e| e.to_string())?;
             let items: Vec<String> = redis::cmd("ZRANGE")
                 .arg(&key)
                 .arg(0)
@@ -2297,9 +1449,9 @@ async fn get_redis_key_value(
                 .arg("WITHSCORES")
                 .query_async(&mut con)
                 .await
-                .unwrap_or_default();
+                .map_err(|e| e.to_string())?;
             (
-                serde_json::to_string_pretty(&items).unwrap_or_default(),
+                serde_json::to_string_pretty(&items).map_err(|e| e.to_string())?,
                 Some(len),
             )
         }
@@ -2308,12 +1460,16 @@ async fn get_redis_key_value(
                 .arg(&key)
                 .query_async(&mut con)
                 .await
-                .unwrap_or(0);
-            let items: Vec<String> = redis::cmd("HGETALL")
+                .map_err(|e| e.to_string())?;
+            let (_, mut items): (u64, Vec<String>) = redis::cmd("HSCAN")
                 .arg(&key)
+                .arg(0)
+                .arg("COUNT")
+                .arg(100)
                 .query_async(&mut con)
                 .await
-                .unwrap_or_default();
+                .map_err(|e| e.to_string())?;
+            items.truncate(200);
             // Convert flat list to key-value pairs
             let mut map = std::collections::HashMap::new();
             let mut iter = items.iter();
@@ -2321,13 +1477,22 @@ async fn get_redis_key_value(
                 map.insert(k.clone(), v.clone());
             }
             (
-                serde_json::to_string_pretty(&map).unwrap_or_default(),
+                serde_json::to_string_pretty(&map).map_err(|e| e.to_string())?,
                 Some(len),
             )
         }
-        _ => ("(unknown type)".to_string(), None),
+        "none" => ("(key expired or does not exist)".to_string(), None),
+        _ => {
+            return Err(format!(
+                "Preview is not supported for Redis type: {}",
+                key_type
+            ))
+        }
     };
 
+    if value.len() > 2 * 1024 * 1024 {
+        return Err("Redis preview exceeds 2 MiB; use the native CLI for this key".into());
+    }
     Ok(RedisKeyInfo {
         key,
         key_type,
@@ -2357,6 +1522,7 @@ pub fn run() {
             export_database_sql,
             cancel_database_export,
             import_database_sql,
+            import_table_rows,
             alter_table,
             get_indexes,
             get_ai_config,
@@ -2367,3 +1533,6 @@ pub fn run() {
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
+
+#[cfg(test)]
+mod integration_tests;

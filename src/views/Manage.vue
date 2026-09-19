@@ -157,7 +157,7 @@ watch(() => route.params.id, () => { void loadConfig() }, { immediate: true })
                 </template>
                 <NTabPane name="info" :tab="t('manage.info')">
                     <p>{{ t('manage.info') }}:</p>
-                    <pre>{{ JSON.stringify(config, null, 2) }}</pre>
+                    <pre>{{ JSON.stringify({ ...config, password: config.password ? '••••••••' : undefined }, null, 2) }}</pre>
                 </NTabPane>
             </NTabs>
          </div>
