@@ -27,10 +27,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: src-tauri -> target
+          cache-on-failure: true
       - name: Install desktop dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev
       - name: Apply reviewed, baseline-checked patches
         run: |
           python .audit_backend.py
@@ -51,15 +52,16 @@ jobs:
       - name: Backend unit tests
         working-directory: src-tauri
         run: cargo test --locked --lib --quiet
-      - name: Prepare final tree for explicit review and connector commit
+      - name: Preserve verified source for explicit review and connector commit
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           rm .audit_backend.py .audit_frontend.py .audit_ai.py .audit_regressions.py .audit_compile.py .github/workflows/audit-materialize.yml
           python - <<'PY'
-          import json, os, subprocess, urllib.request
+          import json, os, subprocess, urllib.request, urllib.error, zipfile
           from pathlib import Path
           base = subprocess.check_output(['git', 'rev-parse', 'HEAD^{tree}'], text=True).strip()
+          head = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
           paths = subprocess.check_output(['git', 'diff', '--name-only', '-z', 'HEAD']).decode().split('\0')
           entries = []
           for path in filter(None, paths):
@@ -67,11 +69,27 @@ jobs:
               if Path(path).exists(): entry['content'] = Path(path).read_text()
               else: entry['sha'] = None
               entries.append(entry)
-          body = json.dumps({'base_tree': base, 'tree': entries}).encode()
+          output = Path('audit-output'); output.mkdir()
+          (output / 'changes.json').write_text(json.dumps({'head': head, 'base_tree': base, 'entries': entries}))
+          with zipfile.ZipFile(output / 'source.zip', 'w', zipfile.ZIP_DEFLATED) as archive:
+              for path in subprocess.check_output(['git', 'ls-files', '-z']).decode().split('\0'):
+                  if path and Path(path).is_file(): archive.write(path)
+          # Workflow deletion is committed separately through the authorized connector.
+          ordinary = [entry for entry in entries if not entry['path'].startswith('.github/workflows/')]
+          body = json.dumps({'base_tree': base, 'tree': ordinary}).encode()
           request = urllib.request.Request('https://api.github.com/repos/happydigua/recch/git/trees', data=body, method='POST', headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json', 'Content-Type': 'application/json', 'User-Agent': 'recch-audit-materializer'})
-          with urllib.request.urlopen(request) as response: tree = json.load(response)
-          print('RECCH_FINAL_TREE=' + tree['sha'])
-          print('::notice title=RECCH_FINAL_TREE::' + tree['sha'])
-          print('No branch reference was changed. Explicit review/commit/merge remains required.')
-          for entry in entries: print(('WRITE ' if 'content' in entry else 'REMOVE ') + entry['path'])
+          try:
+              with urllib.request.urlopen(request) as response: tree = json.load(response)
+              (output / 'tree.json').write_text(json.dumps({'sha': tree['sha'], 'pending': [entry for entry in entries if entry['path'].startswith('.github/workflows/')]}))
+              print('::notice title=RECCH_SOURCE_TREE::' + tree['sha'])
+          except urllib.error.HTTPError as error:
+              print('Tree object not created; verified source retained in artifact. HTTP ' + str(error.code))
+              print(error.read().decode()[:2000])
+          print('No branch reference was changed; explicit connector review, commit and merge remain required.')
           PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: recch-reviewed-source
+          path: audit-output/
+          retention-days: 7
+          if-no-files-found: error
