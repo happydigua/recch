@@ -37,6 +37,7 @@ jobs:
           python .audit_frontend.py
           python .audit_ai.py
           python .audit_regressions.py
+          python .audit_compile.py
       - name: Refresh vulnerable compatible npm dependencies
         run: npm audit fix --ignore-scripts
       - run: npm ci
@@ -46,15 +47,15 @@ jobs:
         run: npm run build
       - name: Update Rust feature lockfile and compile
         working-directory: src-tauri
-        run: cargo check
+        run: cargo check --quiet
       - name: Backend unit tests
         working-directory: src-tauri
-        run: cargo test --locked --lib
+        run: cargo test --locked --lib --quiet
       - name: Prepare final tree for explicit review and connector commit
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          rm .audit_backend.py .audit_frontend.py .audit_ai.py .audit_regressions.py .github/workflows/audit-materialize.yml
+          rm .audit_backend.py .audit_frontend.py .audit_ai.py .audit_regressions.py .audit_compile.py .github/workflows/audit-materialize.yml
           python - <<'PY'
           import json, os, subprocess, urllib.request
           from pathlib import Path
@@ -70,6 +71,7 @@ jobs:
           request = urllib.request.Request('https://api.github.com/repos/happydigua/recch/git/trees', data=body, method='POST', headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json', 'Content-Type': 'application/json', 'User-Agent': 'recch-audit-materializer'})
           with urllib.request.urlopen(request) as response: tree = json.load(response)
           print('RECCH_FINAL_TREE=' + tree['sha'])
+          print('::notice title=RECCH_FINAL_TREE::' + tree['sha'])
           print('No branch reference was changed. Explicit review/commit/merge remains required.')
           for entry in entries: print(('WRITE ' if 'content' in entry else 'REMOVE ') + entry['path'])
           PY
