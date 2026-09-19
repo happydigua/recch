@@ -1,0 +1,31 @@
+name: Audit workbench
+on:
+  push:
+    branches: [fix/deep-audit-20260919]
+permissions:
+  contents: read
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Snapshot tracked source
+        run: git archive --format=zip HEAD -o /tmp/recch-source.zip
+      - name: Audit locked frontend dependencies
+        run: |
+          npm ci --ignore-scripts
+          npm audit --json > /tmp/npm-audit.json || test -s /tmp/npm-audit.json
+          cat /tmp/npm-audit.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: audit-source-and-report
+          path: |
+            /tmp/recch-source.zip
+            /tmp/npm-audit.json
+          retention-days: 3
