@@ -59,16 +59,15 @@ watch(() => props.initialQuery, (newVal) => {
 
 const columns = computed(() => {
   if (results.value.length === 0) return []
-  const firstRow = results.value[0]
+  const firstRow = results.value[0].values
   return Object.keys(firstRow)
-    .filter(key => key !== '__id')
     .map(key => ({
     title: key,
     key: key,
     width: 150,
     ellipsis: { tooltip: true },
     render(row: any) {
-        const val = row[key];
+        const val = row.values[key];
         if (typeof val === 'object' && val !== null) {
             return JSON.stringify(val);
         }
@@ -86,9 +85,11 @@ async function runQuery() {
   try {
     const data = await invoke<any[]>('execute_query', { config, query: sql })
     if (target !== generation || request !== queryRequest) return
-    results.value = data.map((item, index) => ({ ...item, __id: index }))
+    // Keep application row identity separate from every database column name.
+    results.value = data.map((values, rowId) => ({ values, rowId }))
     lastQuery.value = sql; executionTime.value = Math.round(performance.now() - start)
-    const failures = data.filter(row => row.error).map(row => String(row.error))
+    // Only Redis command envelopes use an error field; SQL columns are user data.
+    const failures = config.db_type === 'redis' ? data.filter(row => row.error).map(row => String(row.error)) : []
     if (failures.length) error.value = failures.join('\n')
     else message.success(t('manage.query_success', { time: executionTime.value, rows: data.length }))
   } catch (e) { if (target === generation && request === queryRequest) error.value = String(e) }
@@ -119,7 +120,7 @@ async function generateSQL() {
     query.value = sql; showAIModal.value = false
     message.success(t('ai.sql_generated'))
   } catch (e) { if (target === generation && request === aiRequest) message.error(String(e)) }
-  finally { if (target === generation && request === aiRequest) aiLoading.value = false }
+  finally { if (target === generation && request ===aiRequest) aiLoading.value = false }
 }
 
 // Expose run function if parent wants to trigger it
@@ -167,7 +168,7 @@ defineExpose({
                 v-if="results.length > 0"
                 :columns="columns"
                 :data="results"
-                :row-key="(row: any) => row.__id"
+                :row-key="(row: any) => row.rowId"
                 flex-height
                 :bordered="false"
                 size="small"
@@ -262,4 +263,3 @@ defineExpose({
   margin-top: 8px;
 }
 </style>
-

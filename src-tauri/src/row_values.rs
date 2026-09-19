@@ -129,7 +129,15 @@ mod tests {
         let values = pg_row_to_json_map(&row).unwrap();
         assert_eq!(values["small"], json!(7)); assert_eq!(values["ordinary"], json!(8));
         assert_eq!(values["large"], json!("9223372036854775807"));
-        assert_eq!(values["amount"], json!("12345678901234567890.123456789"));
+        // PostgreSQL's binary numeric decoder can preserve base-10000 padding.
+        // Assert exact decimal equality (never f64), not insignificant trailing zeros.
+        let amount_text = values["amount"].as_str().expect("exact decimals must be text");
+        let expected: sqlx::types::BigDecimal = "12345678901234567890.123456789".parse().unwrap();
+        assert_eq!(amount_text.parse::<sqlx::types::BigDecimal>().unwrap(), expected);
+        let amount_sql = pg_export_values(&row, &["amount".into()]).unwrap();
+        let round_trip: sqlx::types::BigDecimal = sqlx::query_scalar(&format!("SELECT ({amount_sql})::numeric"))
+            .fetch_one(&pool).await.unwrap();
+        assert_eq!(round_trip, expected);
         assert_eq!(values["bytes"].as_str().unwrap().len(), 302);
         let expression = pg_export_values(&row, &["bytes".into(), "document".into(), "absent".into()]).unwrap();
         let restored = sqlx::query(&format!("SELECT {expression}")).fetch_one(&pool).await.unwrap();
