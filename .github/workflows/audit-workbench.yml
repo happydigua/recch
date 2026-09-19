@@ -1,39 +1,74 @@
-name: Audit workbench
+name: Prepare hardening candidate
 on:
   push:
     branches: [fix/deep-audit-20260919]
 permissions:
   contents: read
 jobs:
-  inspect:
+  prepare:
+    if: github.repository == 'happydigua/recch' && github.ref == 'refs/heads/fix/deep-audit-20260919'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    outputs:
+      candidate: ${{ steps.commit.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Apply reviewed source with integrity checks
+        run: python3 .audit/apply.py
+      - name: Resolve and audit frontend lockfile
+        run: |
+          mkdir -p /tmp/audit
+          npm install --ignore-scripts
+          npm audit fix --ignore-scripts
+          npm audit --json > /tmp/audit/npm-audit.json
+      - name: Update compatible Rust dependencies and format
+        run: |
+          cargo update --manifest-path src-tauri/Cargo.toml
+          cargo fmt --manifest-path src-tauri/Cargo.toml
+      - name: Commit candidate to repair branch only
+        id: commit
+        run: |
+          rm -r .audit
+          rm .github/workflows/audit-workbench.yml
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          git commit -m 'fix: harden database sessions, backups, storage, imports and privacy'
+          git push origin HEAD:refs/heads/fix/deep-audit-20260919
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          git archive --format=zip HEAD -o /tmp/audit/candidate-source.zip
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: hardening-candidate
+          path: /tmp/audit/
+          retention-days: 3
+  rust-audit:
+    needs: prepare
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ needs.prepare.outputs.candidate }}
           persist-credentials: false
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
       - uses: dtolnay/rust-toolchain@stable
-      - name: Resolve compatible npm fixes
-        run: |
-          mkdir -p /tmp/audit
-          npm ci --ignore-scripts
-          npm audit fix --ignore-scripts || true
-          npm audit --json > /tmp/audit/npm-audit-after.json || test -s /tmp/audit/npm-audit-after.json
-          cp package-lock.json /tmp/audit/package-lock.json
-          cp package.json /tmp/audit/package.json
-          tar -czf /tmp/audit/frontend-dependencies.tar.gz node_modules
-      - name: Audit Rust lockfile
+      - name: Record remaining RustSec findings without suppressing advisories
         run: |
           cargo install cargo-audit --locked
-          cd src-tauri
-          cargo audit --json > /tmp/audit/cargo-audit.json || test -s /tmp/audit/cargo-audit.json
-          cat /tmp/audit/cargo-audit.json
+          cargo audit --file src-tauri/Cargo.lock --json > /tmp/cargo-audit.json || test -s /tmp/cargo-audit.json
+          cat /tmp/cargo-audit.json
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: dependency-audit
-          path: /tmp/audit/
+          name: rust-audit-after
+          path: /tmp/cargo-audit.json
           retention-days: 3
