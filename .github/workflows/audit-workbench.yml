@@ -7,7 +7,7 @@ permissions:
 jobs:
   inspect:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
         with:
@@ -15,17 +15,25 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-      - name: Snapshot tracked source
-        run: git archive --format=zip HEAD -o /tmp/recch-source.zip
-      - name: Audit locked frontend dependencies
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Resolve compatible npm fixes
         run: |
+          mkdir -p /tmp/audit
           npm ci --ignore-scripts
-          npm audit --json > /tmp/npm-audit.json || test -s /tmp/npm-audit.json
-          cat /tmp/npm-audit.json
+          npm audit fix --ignore-scripts || true
+          npm audit --json > /tmp/audit/npm-audit-after.json || test -s /tmp/audit/npm-audit-after.json
+          cp package-lock.json /tmp/audit/package-lock.json
+          cp package.json /tmp/audit/package.json
+          tar -czf /tmp/audit/frontend-dependencies.tar.gz node_modules
+      - name: Audit Rust lockfile
+        run: |
+          cargo install cargo-audit --locked
+          cd src-tauri
+          cargo audit --json > /tmp/audit/cargo-audit.json || test -s /tmp/audit/cargo-audit.json
+          cat /tmp/audit/cargo-audit.json
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
-          name: audit-source-and-report
-          path: |
-            /tmp/recch-source.zip
-            /tmp/npm-audit.json
+          name: dependency-audit
+          path: /tmp/audit/
           retention-days: 3
