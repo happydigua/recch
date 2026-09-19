@@ -102,3 +102,22 @@ test('CSV treats __proto__ as a data column without mutating object prototypes',
   assert.equal(Object.getPrototypeOf(row), Object.prototype)
   assert.equal(row.__proto__, 'safe')
 })
+
+for (const dialect of ['mysql', 'postgresql']) {
+  test(`${dialect}: binary values remain bytes in writes and exports`, () => {
+    const columns = [{ name: 'id', is_pk: true, type_name: dialect === 'mysql' ? 'varbinary(16)' : 'bytea' }, { name: 'payload', type_name: dialect === 'mysql' ? 'blob' : 'bytea' }]
+    const query = insertQuery('t', { id: '0x0001', payload: '0xABCD' }, dialect, columns)
+    assert.ok(query.includes(dialect === 'mysql' ? "X'ABCD'" : "decode('ABCD', 'hex')"))
+    assert.ok(deleteQuery('t', columns, { id: '0x0001' }, dialect).includes(dialect === 'mysql' ? "X'0001'" : "decode('0001', 'hex')"))
+    assert.throws(() => insertQuery('t', { payload: '0xAB...' }, dialect, columns), /complete/)
+    assert.throws(() => insertQuery('t', { payload: '0xA' }, dialect, columns), /complete/)
+  })
+}
+
+test('JSON import rejects precision loss including nested decimals', async () => {
+  const { parseImportJSON } = await import('../src/utils/dataGrid.ts')
+  for (const source of ['[{"id":9007199254740993}]', '[{"json":{"n":1234.1234567890123456789}}]', '[{"n":1e400}]', '[{"n":1e-400}]']) {
+    assert.throws(() => parseImportJSON(source), /precision/)
+  }
+  assert.deepEqual(parseImportJSON('[{"amount":"1234.1234567890123456789","n":1.2300e2,"small":0.1}]'), [{ amount: '1234.1234567890123456789', n: 123, small: 0.1 }])
+})

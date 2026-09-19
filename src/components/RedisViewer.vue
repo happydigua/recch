@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, watch } from 'vue'
+import { ref, watch, onBeforeUnmount } from 'vue'
 import { 
   NCard, NSpace, NTag, NCode, NSpin, NEmpty, NDescriptions, NDescriptionsItem,
   NIcon, NButton
@@ -26,28 +26,29 @@ const loading = ref(false)
 const keyInfo = ref<RedisKeyInfo | null>(null)
 const error = ref('')
 
+let request = 0
+let disposed = false
+onBeforeUnmount(() => { disposed = true; request++ })
 async function loadKeyInfo() {
-  if (!props.selectedKey) return
-  
-  loading.value = true
+  const ticket = ++request
+  keyInfo.value = null
   error.value = ''
+  loading.value = false
+  if (!props.selectedKey) return
+  const config = { ...props.config }
+  const key = props.selectedKey
+  const database = props.database
+  loading.value = true
   try {
-    const info = await invoke<RedisKeyInfo>('get_redis_key_value', {
-      config: props.config,
-      key: props.selectedKey,
-      database: props.database
-    })
-    keyInfo.value = info
-  } catch (e: any) {
-    error.value = e.toString()
+    const info = await invoke<RedisKeyInfo>('get_redis_key_value', { config, key, database })
+    if (!disposed && ticket === request) keyInfo.value = info
+  } catch (e) {
+    if (!disposed && ticket === request) error.value = String(e)
   } finally {
-    loading.value = false
+    if (!disposed && ticket === request) loading.value = false
   }
 }
-
-watch(() => props.selectedKey, () => {
-  loadKeyInfo()
-}, { immediate: true })
+watch(() => JSON.stringify([props.config, props.database, props.selectedKey]), loadKeyInfo, { immediate: true, flush: 'sync' })
 
 function getTypeColor(type: string): 'default' | 'info' | 'warning' | 'error' | 'success' | 'primary' {
   const colors: Record<string, 'default' | 'info' | 'warning' | 'error' | 'success' | 'primary'> = {
@@ -104,12 +105,13 @@ function formatTTL(ttl: number): string {
               </NSpace>
             </NDescriptionsItem>
             <NDescriptionsItem v-if="keyInfo.length !== undefined" label="长度">
-              {{ keyInfo.length }} 个元素
+              {{ keyInfo.length }} {{ keyInfo.key_type === 'string' ? '字节' : '个元素' }}
             </NDescriptionsItem>
           </NDescriptions>
         </NCard>
         
         <NCard size="small" title="值" class="value-card">
+          <p>仅预览：字符串最多 64 KiB，集合最多 100 项；不是完整备份。</p>
           <NCode :code="keyInfo.value" language="json" word-wrap />
         </NCard>
       </div>

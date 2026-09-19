@@ -2,7 +2,7 @@
 import { ref, watch, computed, h, onBeforeUnmount } from 'vue'
 import {
   NDataTable, NButton, NSpace, NIcon, NPagination, useMessage, useDialog,
-  NModal, NForm, NFormItem, NInput, NInputNumber, NCheckbox, NSelect,
+  NModal, NForm, NFormItem, NInput, NCheckbox, NSelect,
   NDropdown, NInputGroup, NEllipsis
 } from 'naive-ui'
 import {
@@ -17,7 +17,7 @@ import type { ConnectionConfig } from '../types'
 import type { DataTableColumns } from 'naive-ui'
 import {
   sqlDialect, quoteIdentifier, primaryKeyWhere, insertQuery, updateQuery,
-  deleteQuery, searchWhere, parseCSV
+  deleteQuery, searchWhere, parseCSV, parseImportJSON
 } from '../utils/dataGrid'
 
 const props = defineProps<{
@@ -108,13 +108,13 @@ watch(tableMetadata, (newMeta) => {
                 if (typeof val === 'string' && val.trim()) {
                     const trimmed = val.trim()
                     if ((trimmed.startsWith('{') && trimmed.endsWith('}')) || (trimmed.startsWith('[') && trimmed.endsWith(']'))) {
-                        try { val = JSON.parse(val); isJson = true } catch { /* not JSON */ }
+                        try { JSON.parse(val); isJson = true } catch { /* validate without replacing original numeric tokens */ }
                     }
                 }
                 if (isJson) {
-                    const fullStr = JSON.stringify(val)
+                    const fullStr = typeof val === 'string' ? val : JSON.stringify(val)
                     const preview = fullStr.length > 50 ? fullStr.slice(0, 50) + '...' : fullStr
-                    return h('span', { style: 'color: #18a058; cursor: default;', title: JSON.stringify(val, null, 2) }, preview)
+                    return h('span', { style: 'color: #18a058; cursor: default;', title: typeof val === 'string' ? val : JSON.stringify(val, null, 2) }, preview)
                 }
                 if (typeof val === 'string' && val.length > 100) {
                     return h('span', { style: 'cursor: default;', title: val }, val.slice(0, 80) + '...')
@@ -240,8 +240,10 @@ function handleSorterChange(sorter: { columnKey: string, order: 'ascend' | 'desc
     handleSearch()
 }
 
+function isBooleanColumn(col: { type_name: string }): boolean { return /^(BOOL|BOOLEAN)$/i.test(col.type_name) }
+
 function editValue(value: any): any {
-    return value !== null && typeof value === 'object' ? JSON.stringify(value) : value
+    return typeof value === 'number' ? String(value) : value !== null && typeof value === 'object' ? JSON.stringify(value) : value
 }
 
 function openCreate() {
@@ -297,7 +299,7 @@ async function handleSubmit() {
         if (modalMode.value === 'create') {
             // Untouched null fields use database defaults; an entered empty string is data.
             const values = Object.fromEntries(Object.entries(formData.value).filter(([, value]) => value !== null))
-            query = insertQuery(target.table, values, target.dialect)
+            query = insertQuery(target.table, values, target.dialect, tableMetadata.value)
         } else {
             const values = Object.fromEntries(Object.entries(formData.value).filter(([key, value]) =>
                 !primaryKeys.value.includes(key) && value !== editValue(originalRow.value[key])
@@ -335,7 +337,7 @@ async function handleExport(key: string) {
         } else if (key === 'json') content = JSON.stringify(allRows, null, 2)
         else content = allRows.map(row => {
             const values = Object.fromEntries(columns.map(column => [column, row[column]]))
-            return `${insertQuery(target.table, values, target.dialect)};`
+            return `${insertQuery(target.table, values, target.dialect, tableMetadata.value)};`
         }).join('\n')
         const filePath = await save({
             defaultPath: `${target.table}.${key}`,
@@ -350,8 +352,8 @@ async function handleExport(key: string) {
 async function triggerImport() {
     if (!schemaReady) return
     const target = captureTarget()
-    const columnNames = new Set(tableMetadata.value.map(column => column.name))
-    let successCount = 0
+    const metadata = tableMetadata.value.map(column => ({ ...column }))
+    const columnNames = new Set(metadata.map(column => column.name))
     try {
         const filePath = await open({ filters: [{ name: 'Data', extensions: ['csv', 'json'] }], multiple: false })
         if (!filePath) return
@@ -361,7 +363,7 @@ async function triggerImport() {
         const ext = (filePath as string).split('.').pop()?.toLowerCase()
         let rows: Record<string, any>[]
         if (ext === 'json') {
-            const parsed = JSON.parse(text)
+            const parsed = parseImportJSON(text)
             rows = Array.isArray(parsed) ? parsed : [parsed]
         } else if (ext === 'csv') rows = parseCSV(text)
         else throw new Error('支持 CSV / JSON 格式')
@@ -371,17 +373,13 @@ async function triggerImport() {
             if (!row || typeof row !== 'object' || Array.isArray(row)) throw new Error('Each imported row must be an object')
             const unknown = Object.keys(row).filter(name => !columnNames.has(name))
             if (unknown.length) throw new Error(`Unknown columns: ${unknown.join(', ')}`)
-            return insertQuery(target.table, row, target.dialect)
+            return insertQuery(target.table, row, target.dialect, metadata)
         })
-        for (const query of queries) {
-            if (!isCurrent(target)) throw new Error('Selection changed; remaining import cancelled')
-            await invoke('execute_query', { config: target.config, query })
-            successCount++
-        }
-        message.success(t('manage.import_success', { count: successCount }))
-    } catch (e: any) {
-        // Row-by-row imports are not atomic; report the committed prefix honestly.
-        message.error(`${t('manage.import_failed')}: ${e.toString()} (${successCount} rows imported)`)
+        if (!isCurrent(target)) throw new Error('Selection changed; import cancelled')
+        const count = await invoke<number>('import_table_rows', { config: target.config, table: target.table, queries })
+        if (isCurrent(target)) message.success(t('manage.import_success', { count }))
+    } catch (e) {
+        if (isCurrent(target)) message.error(`${t('manage.import_failed')}: ${String(e)}`)
     } finally {
         if (isCurrent(target)) { loading.value = false; await loadData(target) }
     }
@@ -479,8 +477,7 @@ async function triggerImport() {
                         <span v-if="col.comment" style="color: #999; font-size: 12px;">({{ col.comment }})</span>
                     </NSpace>
                  </template>
-                 <NCheckbox v-if="col.type_name.toUpperCase().includes('BOOL')" v-model:checked="formData[col.name]" :disabled="modalMode === 'edit' && col.is_pk" />
-                 <NInputNumber v-else-if="['INT', 'FLOAT', 'DOUBLE', 'DECIMAL', 'NUMERIC', 'REAL'].some(t => col.type_name.toUpperCase().includes(t))" v-model:value="formData[col.name]" :disabled="modalMode === 'edit' && col.is_pk" />
+                 <NCheckbox v-if="isBooleanColumn(col)" v-model:checked="formData[col.name]" :disabled="modalMode === 'edit' && col.is_pk" />
                  <NInput v-else v-model:value="formData[col.name]" :disabled="modalMode === 'edit' && col.is_pk" placeholder="Raw value" />
              </NFormItem>
         </NForm>

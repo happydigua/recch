@@ -14,6 +14,7 @@ commands.allow = [
     "export_database_sql",
     "cancel_database_export",
     "import_database_sql",
+    "import_table_rows",
     "alter_table",
     "get_indexes",
     "get_ai_config",

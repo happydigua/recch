@@ -48,6 +48,8 @@ const progressMeta = ref('')
 const currentExportTaskId = ref<string | null>(null)
 const cancelExportLoading = ref(false)
 
+let disposed = false
+let choosingDatabase = false
 let unlistenExportProgress: null | (() => void) = null
 
 interface ExportProgressPayload {
@@ -55,7 +57,7 @@ interface ExportProgressPayload {
   database: string
   progress: number
   status: 'running' | 'completed' | 'cancelled' | 'error'
-  stage: 'preparing' | 'schema' | 'counting' | 'fetching' | 'data' | 'table_complete' | 'completed' | 'cancelled' | 'error'
+  stage: 'native_dump' | 'preparing' | 'schema' | 'counting' | 'fetching' | 'data' | 'table_complete' | 'completed' | 'cancelled' | 'error'
   table_name?: string | null
   processed_tables: number
   total_tables: number
@@ -248,6 +250,8 @@ function formatExportProgress(payload: ExportProgressPayload) {
   const table = payload.table_name || ''
 
   switch (payload.stage) {
+    case 'native_dump':
+      return '原生备份工具正在导出；工具不提供可靠百分比，完成后显示结果。'
     case 'schema':
       return t('manage.export_progress_schema', { table })
     case 'counting':
@@ -300,9 +304,9 @@ async function setupExportProgressListener() {
   if (!isTauri()) return
 
   const { listen } = await import('@tauri-apps/api/event')
-  unlistenExportProgress = await listen<ExportProgressPayload>('database-export-progress', (event) => {
+  const unlisten = await listen<ExportProgressPayload>('database-export-progress', (event) => {
     const payload = event.payload
-    if (!payload || payload.task_id !== currentExportTaskId.value) {
+    if (disposed || !payload || payload.task_id !== currentExportTaskId.value) {
       return
     }
 
@@ -314,6 +318,8 @@ async function setupExportProgressListener() {
       cancelExportLoading.value = false
     }
   })
+  if (disposed) unlisten()
+  else unlistenExportProgress = unlisten
 }
 
 async function stopExport() {
@@ -335,6 +341,7 @@ async function stopExport() {
 
 async function exportDatabase(row: ConnectionConfig, database: string) {
   try {
+    message.info('整库导出需要 PATH 中的 pg_dump 或 MySQL 8 mysqldump。目标文件仅在完整导出成功后替换。')
     const filePath = await save({
       defaultPath: `${database}.sql`,
       filters: [{ name: 'SQL', extensions: ['sql'] }]
@@ -374,12 +381,14 @@ async function importDatabase(row: ConnectionConfig, database: string) {
     })
     if (!filePath) return
 
-    dialog.warning({
+    await new Promise<void>(resolve => { dialog.warning({
+      onNegativeClick: () => resolve(), onClose: () => resolve(), onMaskClick: () => resolve(),
       title: t('manage.import'),
-      content: t('manage.database_import_confirm', { name: database }),
+      content: t('manage.database_import_confirm', { name: database }) + ' 仅导入可信 SQL。脚本可能删除数据；失败时已提交语句不一定回滚，请先备份。',
       positiveText: t('manage.import'),
       negativeText: t('common.cancel'),
       onPositiveClick: async () => {
+        if (disposed) { resolve(); return }
         try {
           showProgress(
             t('manage.import'),
@@ -392,10 +401,10 @@ async function importDatabase(row: ConnectionConfig, database: string) {
         } catch (error) {
           message.error(t('manage.database_import_failed') + ': ' + error)
         } finally {
-          hideProgress()
+          hideProgress(); resolve()
         }
       }
-    })
+    }) })
   } catch (error) {
     message.error(t('manage.database_import_failed') + ': ' + error)
   }
@@ -415,13 +424,16 @@ async function runDatabaseAction(row: ConnectionConfig, database: string, action
 }
 
 async function handleDatabaseAction(row: ConnectionConfig, action: 'export' | 'import') {
+  if (disposed || choosingDatabase || actionLoadingKey.value || showDatabaseModal.value || progressVisible.value) return
   if (row.database) {
     await runDatabaseAction(row, row.database, action)
     return
   }
 
+  choosingDatabase = true
   try {
     const dbs = await invoke<string[]>('get_databases', { config: row })
+    if (disposed) return
     if (!dbs.length) {
       message.warning(t('connection.no_databases'))
       return
@@ -439,7 +451,7 @@ async function handleDatabaseAction(row: ConnectionConfig, action: 'export' | 'i
     showDatabaseModal.value = true
   } catch (error) {
     message.error(t('common.error') + ': ' + error)
-  }
+  } finally { choosingDatabase = false }
 }
 
 async function confirmDatabaseAction() {
@@ -461,6 +473,7 @@ onMounted(async () => {
 })
 
 onBeforeUnmount(() => {
+  disposed = true
   unlistenExportProgress?.()
 })
 </script>
@@ -529,7 +542,9 @@ onBeforeUnmount(() => {
     >
       <div v-if="progressMode === 'export'" class="progress-panel">
         <div class="progress-text">{{ progressDescription }}</div>
+        <NSpin v-if="progressMode === 'export' && progressPercent < 100" size="small" />
         <NProgress
+          v-else
           type="line"
           :percentage="progressPercent"
           :processing="progressPercent < 100"

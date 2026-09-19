@@ -1,6 +1,6 @@
 /** SQL builders for identifiers and JSON values returned by the database grid. */
 export type SqlDialect = 'mysql' | 'postgresql'
-export interface GridColumn { name: string; is_pk?: boolean }
+export interface GridColumn { name: string; is_pk?: boolean; type_name?: string }
 export type GridRow = Record<string, unknown>
 
 export function sqlDialect(dbType: string): SqlDialect {
@@ -37,26 +37,39 @@ export function sqlLiteral(value: unknown, dialect: SqlDialect): string {
   return `E'${text.replace(/\\/g, '\\\\').replace(/'/g, "''")}'`
 }
 
+/** Binary columns carry complete hex, not text previews. */
+export function typedLiteral(value: unknown, column: GridColumn | undefined, dialect: SqlDialect): string {
+  if (value !== null && /^(?:BYTEA|(?:TINY|MEDIUM|LONG)?BLOB|(?:VAR)?BINARY)(?:\b|\()/i.test(column?.type_name || '')) {
+    if (typeof value !== 'string' || !/^0x(?:[0-9a-f]{2})*$/i.test(value)) {
+      throw new Error('Binary values must be complete 0x-prefixed hexadecimal bytes')
+    }
+    const hex = value.slice(2)
+    return dialect === 'mysql' ? `X'${hex}'` : `decode('${hex}', 'hex')`
+  }
+  return sqlLiteral(value, dialect)
+}
+
 export function primaryKeyWhere(columns: GridColumn[], row: GridRow, dialect: SqlDialect): string {
   const keys = columns.filter(column => column.is_pk)
   if (!keys.length) throw new Error('Cannot modify a row without a primary key')
-  const predicates = keys.map(({ name }) => {
+  const predicates = keys.map(column => {
+    const { name } = column
     if (!Object.prototype.hasOwnProperty.call(row, name) || row[name] === null || row[name] === undefined) {
       throw new Error(`Missing primary key value: ${name}`)
     }
-    return `${quoteIdentifier(name, dialect)} = ${sqlLiteral(row[name], dialect)}`
+    return `${quoteIdentifier(name, dialect)} = ${typedLiteral(row[name], column, dialect)}`
   })
   return `WHERE ${predicates.join(' AND ')}`
 }
 
-export function insertQuery(table: string, row: GridRow, dialect: SqlDialect): string {
+export function insertQuery(table: string, row: GridRow, dialect: SqlDialect, columns: GridColumn[] = []): string {
   if (!row || typeof row !== 'object' || Array.isArray(row)) throw new Error('Expected a data object')
   const entries = Object.entries(row).filter(([, value]) => value !== undefined)
   const target = quoteIdentifier(table, dialect)
   if (!entries.length) return dialect === 'mysql'
     ? `INSERT INTO ${target} () VALUES ()`
     : `INSERT INTO ${target} DEFAULT VALUES`
-  return `INSERT INTO ${target} (${entries.map(([name]) => quoteIdentifier(name, dialect)).join(', ')}) VALUES (${entries.map(([, value]) => sqlLiteral(value, dialect)).join(', ')})`
+  return `INSERT INTO ${target} (${entries.map(([name]) => quoteIdentifier(name, dialect)).join(', ')}) VALUES (${entries.map(([name, value]) => typedLiteral(value, columns.find(c => c.name === name), dialect)).join(', ')})`
 }
 
 export function updateQuery(table: string, columns: GridColumn[], original: GridRow, values: GridRow, dialect: SqlDialect): string {
@@ -64,7 +77,7 @@ export function updateQuery(table: string, columns: GridColumn[], original: Grid
   const keys = new Set(columns.filter(column => column.is_pk).map(column => column.name))
   const assignments = Object.entries(values)
     .filter(([name, value]) => !keys.has(name) && value !== undefined)
-    .map(([name, value]) => `${quoteIdentifier(name, dialect)} = ${sqlLiteral(value, dialect)}`)
+    .map(([name, value]) => `${quoteIdentifier(name, dialect)} = ${typedLiteral(value, columns.find(c => c.name === name), dialect)}`)
   if (!assignments.length) throw new Error('No editable columns to update')
   return `UPDATE ${quoteIdentifier(table, dialect)} SET ${assignments.join(', ')} ${where}`
 }
@@ -130,4 +143,37 @@ export function parseCSV(text: string): Record<string, string>[] {
     if (values.length !== headers.length) throw new Error(`CSV record ${index + 2} has an incorrect column count`)
     return Object.fromEntries(headers.map((header, index) => [header, values[index]!]))
   })
+}
+
+/** Reject JSON numeric tokens that JavaScript would silently round on import. */
+export function parseImportJSON(text: string): unknown {
+  if (text.length > 16 * 1024 * 1024) throw new Error('JSON import exceeds 16 MiB')
+  function canonical(token: string): string {
+    const [mantissa = '', exponent = '0'] = token.toLowerCase().split('e')
+    let digits = mantissa.replace('.', '')
+    let power = BigInt(exponent) - BigInt((mantissa.split('.')[1] || '').length)
+    const negative = digits.startsWith('-')
+    if (negative) digits = digits.slice(1)
+    digits = digits.replace(/^0+/, '') || '0'
+    while (digits.length > 1 && digits.endsWith('0')) { digits = digits.slice(0, -1); power++ }
+    return `${negative ? '-' : ''}${digits}e${digits === '0' ? 0n : power}`
+  }
+  for (let i = 0; i < text.length; i++) {
+    if (text[i] === '"') {
+      for (i++; i < text.length; i++) {
+        if (text[i] === '\\') i++
+        else if (text[i] === '"') break
+      }
+    } else if (text[i] === '-' || /[0-9]/.test(text[i]!)) {
+      const token = text.slice(i).match(/^-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?/)?.[0]
+      if (!token) continue
+      if (token.length > 256) throw new Error('JSON numeric token is too large')
+      const value = Number(token)
+      if (!Number.isFinite(value) || Number.isInteger(value) && !Number.isSafeInteger(value) || canonical(token) !== canonical(String(value))) {
+        throw new Error('JSON contains a number that would lose precision; encode exact numeric columns as strings, or supply a JSON column as raw JSON text')
+      }
+      i += token.length - 1
+    }
+  }
+  return JSON.parse(text)
 }

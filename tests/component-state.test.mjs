@@ -15,6 +15,7 @@ function setupComponent(file, start, exposed, overrides) {
   const dialogs = []
   const bindings = {
     ref, computed, watch, h, ...sql,
+    defineExpose: () => {},
     onBeforeUnmount: callback => disposers.push(callback),
     useI18n: () => ({ t: key => key }),
     useMessage: () => Object.fromEntries(['success', 'warning', 'error'].map(kind => [kind, text => messages.push({ kind, text })])),
@@ -127,4 +128,70 @@ test('manage: selection does not mutate the tree config, and route reuse reloads
     assert.equal(harness.state.selectedTable.value, '')
     assert.equal(harness.state.queryConfig.value.database, 'fixed')
   } finally { harness.close() }
+})
+
+test('Redis viewer reloads same key on database change and rejects old result', async () => {
+  const props = reactive({ config: { ...config, db_type: 'redis' }, selectedKey: 'same', database: 'db0' })
+  const pending = []
+  const component = setupComponent('../src/components/RedisViewer.vue', 'const props =', 'keyInfo,error,loadKeyInfo', {
+    defineProps: () => props,
+    invoke: (_name, args) => new Promise(resolve => pending.push({ args, resolve }))
+  })
+  try {
+    assert.equal(pending.length, 1)
+    props.database = 'db1'
+    await settle()
+    pending[1].resolve({ key: 'same', value: 'new' }); await settle()
+    pending[0].resolve({ key: 'same', value: 'old' }); await settle()
+    assert.equal(component.state.keyInfo.value.value, 'new')
+  } finally { component.close() }
+})
+
+test('query console ignores a result after changing the database', async () => {
+  const props = reactive({ config: { ...config }, selectedDatabase: 'first' })
+  let resolve
+  const component = setupComponent('../src/components/QueryConsole.vue', 'const props =', 'query,results,runQuery', {
+    defineProps: () => props, invoke: () => new Promise(done => { resolve = done })
+  })
+  try {
+    component.state.query.value = 'SELECT 1'
+    const pending = component.state.runQuery()
+    props.selectedDatabase = 'second'; await settle()
+    resolve([{ result: 'old' }]); await pending
+    assert.deepEqual(component.state.results.value, [])
+  } finally { component.close() }
+})
+
+test('AI cannot transmit a prompt without explicit consent', async () => {
+  const calls = []
+  const component = setupComponent('../src/components/QueryConsole.vue', 'const props =', 'aiPrompt,aiConsent,generateSQL', {
+    defineProps: () => ({ config }), invoke: async (...args) => { calls.push(args); return [] }
+  })
+  try {
+    component.state.aiPrompt.value = 'private prompt'
+    await component.state.generateSQL()
+    assert.equal(calls.length, 0)
+  } finally { component.close() }
+})
+
+test('schema editor blocks stale deletion and combines rename/modify', async () => {
+  const props = reactive({ config: { ...config }, table: 'same', database: 'first' })
+  const calls = []
+  const component = setupComponent('../src/components/TableStructure.vue', 'const props =', 'handleDrop,openEdit,formModel,handleSubmit', {
+    defineProps: () => props, invoke: async (...args) => { calls.push(args); return [] }
+  })
+  try {
+    await settle()
+    component.state.handleDrop({ name: 'old', type_name: 'integer', is_pk: false })
+    props.database = 'second'; await settle()
+    await component.dialogs[0].onPositiveClick()
+    assert.equal(calls.filter(([name]) => name === 'alter_table').length, 0)
+    component.state.openEdit({ name: 'old', type_name: 'integer', is_pk: false })
+    component.state.formModel.value.name = 'new'
+    await component.state.handleSubmit()
+    const writes = calls.filter(([name]) => name === 'alter_table')
+    assert.equal(writes.length, 1)
+    assert.equal(writes[0][1].operation.column_name, 'old')
+    assert.equal(writes[0][1].operation.column_def.name, 'new')
+  } finally { component.close() }
 })
